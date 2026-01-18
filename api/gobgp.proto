@@ -703,6 +703,7 @@ message Peer {
   GracefulRestart graceful_restart = 9;
   repeated AfiSafi afi_safis = 10;
   TtlSecurity ttl_security = 11;
+  TcpAo tcp_ao = 12;
 }
 
 message PeerGroup {
@@ -797,6 +798,20 @@ message PeerGroupState {
 message TtlSecurity {
   bool enabled = 1;
   uint32 ttl_min = 2;
+}
+
+// TCP Authentication Option (RFC 5925) configuration
+message TcpAo {
+  // Enable TCP AO authentication
+  bool enabled = 1;
+  // The shared secret key for TCP AO
+  string key = 2;
+  // Send key ID (0-255)
+  uint32 send_id = 3;
+  // Receive key ID (0-255)
+  uint32 recv_id = 4;
+  // Algorithm: "cmac-aes-128" or "hmac-sha1-96" (default: cmac-aes-128)
+  string algorithm = 5;
 }
 
 message EbgpMultihop {

@@ -16,6 +16,7 @@
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
 
+// TCP MD5 Signature Option (RFC 2385)
 #[repr(C)]
 struct TcpMd5sig {
     ss_family: u16,
@@ -74,3 +75,304 @@ pub(crate) fn set_md5sig(rawfd: RawFd, addr: &IpAddr, key: &str) {
 // for now, let's keep things simple
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn set_md5sig(_rawfd: RawFd, _addr: &IpAddr, _key: &str) {}
+
+// TCP Authentication Option (RFC 5925)
+// Linux kernel support added in 5.18+
+
+/// TCP AO key configuration for BGP session authentication
+#[derive(Clone, Debug)]
+pub struct TcpAoConfig {
+    /// The shared secret key
+    pub key: String,
+    /// Send key ID (0-255)
+    pub send_id: u8,
+    /// Receive key ID (0-255)
+    pub recv_id: u8,
+    /// Algorithm: "cmac-aes-128" or "hmac-sha1-96" (default: cmac-aes-128)
+    pub algorithm: TcpAoAlgorithm,
+}
+
+impl TcpAoConfig {
+    pub fn new(key: String, send_id: u8, recv_id: u8) -> Self {
+        TcpAoConfig {
+            key,
+            send_id,
+            recv_id,
+            algorithm: TcpAoAlgorithm::CmacAes128,
+        }
+    }
+
+    pub fn with_algorithm(mut self, algorithm: TcpAoAlgorithm) -> Self {
+        self.algorithm = algorithm;
+        self
+    }
+}
+
+/// TCP AO algorithm options
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpAoAlgorithm {
+    /// AES-128-CMAC (recommended, default)
+    CmacAes128,
+    /// HMAC-SHA1-96
+    HmacSha1_96,
+}
+
+impl TcpAoAlgorithm {
+    /// Returns the algorithm name as expected by the kernel
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TcpAoAlgorithm::CmacAes128 => "cmac(aes128)",
+            TcpAoAlgorithm::HmacSha1_96 => "hmac(sha1)",
+        }
+    }
+
+    /// Returns the MAC length for this algorithm
+    pub fn maclen(&self) -> u8 {
+        match self {
+            TcpAoAlgorithm::CmacAes128 => 16,
+            TcpAoAlgorithm::HmacSha1_96 => 12,
+        }
+    }
+}
+
+impl Default for TcpAoAlgorithm {
+    fn default() -> Self {
+        TcpAoAlgorithm::CmacAes128
+    }
+}
+
+// Linux TCP AO socket option constants
+#[cfg(target_os = "linux")]
+const TCP_AO_ADD_KEY: libc::c_int = 38;
+#[cfg(target_os = "linux")]
+const TCP_AO_DEL_KEY: libc::c_int = 39;
+
+// TCP AO key flags
+#[cfg(target_os = "linux")]
+const TCP_AO_KEYF_IFINDEX: u8 = 0x01;
+#[cfg(target_os = "linux")]
+const TCP_AO_KEYF_EXCLUDE_OPT: u8 = 0x02;
+
+// Maximum key length for TCP AO
+const TCP_AO_MAXKEYLEN: usize = 80;
+
+/// Structure for adding a TCP AO key (matches Linux struct tcp_ao_add)
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct TcpAoAdd {
+    /// Remote address (sockaddr_storage)
+    addr: [u8; 128],
+    /// Key data
+    key: [u8; TCP_AO_MAXKEYLEN],
+    /// Key flags
+    keyflags: u8,
+    /// Length of key
+    keylen: u8,
+    /// Prefix length for address matching
+    prefix: u8,
+    /// Send key ID
+    sndid: u8,
+    /// Receive key ID
+    rcvid: u8,
+    /// MAC length
+    maclen: u8,
+    /// Padding
+    _reserved: u8,
+    /// Set as current key
+    set_current: u8,
+    /// Set as receive next key
+    set_rnext: u8,
+    /// Padding
+    _reserved2: [u8; 7],
+    /// Interface index
+    ifindex: i32,
+    /// Algorithm name (null-terminated)
+    alg_name: [u8; 64],
+}
+
+#[cfg(target_os = "linux")]
+impl TcpAoAdd {
+    fn new(addr: &IpAddr, config: &TcpAoConfig) -> Self {
+        let mut s = TcpAoAdd {
+            addr: [0; 128],
+            key: [0; TCP_AO_MAXKEYLEN],
+            keyflags: 0,
+            keylen: 0,
+            prefix: 0,
+            sndid: config.send_id,
+            rcvid: config.recv_id,
+            maclen: config.algorithm.maclen(),
+            _reserved: 0,
+            set_current: 1,
+            set_rnext: 1,
+            _reserved2: [0; 7],
+            ifindex: 0,
+            alg_name: [0; 64],
+        };
+
+        // Set address and prefix based on IP version
+        match addr {
+            std::net::IpAddr::V4(addr) => {
+                // sockaddr_in structure
+                s.addr[0] = (libc::AF_INET & 0xff) as u8;
+                s.addr[1] = ((libc::AF_INET >> 8) & 0xff) as u8;
+                // port at offset 2-3 (set to 0)
+                // address at offset 4-7
+                s.addr[4..8].clone_from_slice(&addr.octets()[..]);
+                s.prefix = 32; // Full match for IPv4
+            }
+            std::net::IpAddr::V6(addr) => {
+                // sockaddr_in6 structure
+                s.addr[0] = (libc::AF_INET6 & 0xff) as u8;
+                s.addr[1] = ((libc::AF_INET6 >> 8) & 0xff) as u8;
+                // port at offset 2-3 (set to 0)
+                // flowinfo at offset 4-7 (set to 0)
+                // address at offset 8-23
+                s.addr[8..24].clone_from_slice(&addr.octets()[..]);
+                s.prefix = 128; // Full match for IPv6
+            }
+        };
+
+        // Copy key
+        let key_bytes = config.key.as_bytes();
+        let keylen = std::cmp::min(key_bytes.len(), TCP_AO_MAXKEYLEN);
+        s.key[..keylen].clone_from_slice(&key_bytes[..keylen]);
+        s.keylen = keylen as u8;
+
+        // Set algorithm name
+        let alg_name = config.algorithm.as_str();
+        let alg_bytes = alg_name.as_bytes();
+        let alg_len = std::cmp::min(alg_bytes.len(), 63);
+        s.alg_name[..alg_len].clone_from_slice(&alg_bytes[..alg_len]);
+
+        s
+    }
+}
+
+/// Structure for deleting a TCP AO key (matches Linux struct tcp_ao_del)
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct TcpAoDel {
+    /// Remote address (sockaddr_storage)
+    addr: [u8; 128],
+    /// Prefix length for address matching
+    prefix: u8,
+    /// Key flags
+    keyflags: u8,
+    /// Padding
+    _reserved: u16,
+    /// Send key ID (set -1 to delete all keys for address)
+    sndid: i16,
+    /// Receive key ID (set -1 to delete all keys for address)
+    rcvid: i16,
+    /// Current key (output)
+    current_key: u8,
+    /// Receive next key (output)
+    rnext: u8,
+    /// Number of keys deleted (output)
+    del_async_count: u16,
+    /// Interface index
+    ifindex: i32,
+}
+
+#[cfg(target_os = "linux")]
+impl TcpAoDel {
+    fn new(addr: &IpAddr, send_id: Option<u8>, recv_id: Option<u8>) -> Self {
+        let mut s = TcpAoDel {
+            addr: [0; 128],
+            prefix: 0,
+            keyflags: 0,
+            _reserved: 0,
+            sndid: send_id.map(|id| id as i16).unwrap_or(-1),
+            rcvid: recv_id.map(|id| id as i16).unwrap_or(-1),
+            current_key: 0,
+            rnext: 0,
+            del_async_count: 0,
+            ifindex: 0,
+        };
+
+        // Set address and prefix based on IP version
+        match addr {
+            std::net::IpAddr::V4(addr) => {
+                s.addr[0] = (libc::AF_INET & 0xff) as u8;
+                s.addr[1] = ((libc::AF_INET >> 8) & 0xff) as u8;
+                s.addr[4..8].clone_from_slice(&addr.octets()[..]);
+                s.prefix = 32;
+            }
+            std::net::IpAddr::V6(addr) => {
+                s.addr[0] = (libc::AF_INET6 & 0xff) as u8;
+                s.addr[1] = ((libc::AF_INET6 >> 8) & 0xff) as u8;
+                s.addr[8..24].clone_from_slice(&addr.octets()[..]);
+                s.prefix = 128;
+            }
+        };
+
+        s
+    }
+}
+
+/// Add a TCP AO key to the socket for the specified peer address
+#[cfg(target_os = "linux")]
+pub(crate) fn set_tcp_ao(rawfd: RawFd, addr: &IpAddr, config: &TcpAoConfig) -> Result<(), i32> {
+    let s = TcpAoAdd::new(addr, config);
+    unsafe {
+        let ptr: *const TcpAoAdd = &s;
+        let len = std::mem::size_of::<TcpAoAdd>() as u32;
+        let ret = libc::setsockopt(
+            rawfd,
+            libc::IPPROTO_TCP,
+            TCP_AO_ADD_KEY,
+            ptr as *const _,
+            len,
+        );
+        if ret < 0 {
+            return Err(*libc::__errno_location());
+        }
+    }
+    Ok(())
+}
+
+/// Remove a TCP AO key from the socket
+/// If send_id and recv_id are None, all keys for the address are removed
+#[cfg(target_os = "linux")]
+pub(crate) fn del_tcp_ao(
+    rawfd: RawFd,
+    addr: &IpAddr,
+    send_id: Option<u8>,
+    recv_id: Option<u8>,
+) -> Result<(), i32> {
+    let s = TcpAoDel::new(addr, send_id, recv_id);
+    unsafe {
+        let ptr: *const TcpAoDel = &s;
+        let len = std::mem::size_of::<TcpAoDel>() as u32;
+        let ret = libc::setsockopt(
+            rawfd,
+            libc::IPPROTO_TCP,
+            TCP_AO_DEL_KEY,
+            ptr as *const _,
+            len,
+        );
+        if ret < 0 {
+            return Err(*libc::__errno_location());
+        }
+    }
+    Ok(())
+}
+
+// Non-Linux stub implementations
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn set_tcp_ao(_rawfd: RawFd, _addr: &IpAddr, _config: &TcpAoConfig) -> Result<(), i32> {
+    // TCP AO is only supported on Linux 5.18+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn del_tcp_ao(
+    _rawfd: RawFd,
+    _addr: &IpAddr,
+    _send_id: Option<u8>,
+    _recv_id: Option<u8>,
+) -> Result<(), i32> {
+    // TCP AO is only supported on Linux 5.18+
+    Ok(())
+}

@@ -195,6 +195,7 @@ struct Peer {
     route_server_client: bool,
     multihop_ttl: Option<u8>,
     password: Option<String>,
+    tcp_ao: Option<auth::TcpAoConfig>,
 
     mgmt_tx: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
 }
@@ -251,6 +252,7 @@ struct PeerBuilder {
     ctrl_channel: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
     multihop_ttl: Option<u8>,
     password: Option<String>,
+    tcp_ao: Option<auth::TcpAoConfig>,
     families: FnvHashMap<Family, bool>,
 }
 
@@ -277,6 +279,7 @@ impl PeerBuilder {
             ctrl_channel: None,
             multihop_ttl: None,
             password: None,
+            tcp_ao: None,
             families: Default::default(),
         }
     }
@@ -362,6 +365,11 @@ impl PeerBuilder {
         self
     }
 
+    fn tcp_ao(&mut self, config: auth::TcpAoConfig) -> &mut Self {
+        self.tcp_ao = Some(config);
+        self
+    }
+
     fn multihop_ttl(&mut self, ttl: u8) -> &mut Self {
         if ttl == 0 {
             self.multihop_ttl = None;
@@ -432,6 +440,7 @@ impl PeerBuilder {
             counter_rx: Default::default(),
             multihop_ttl: self.multihop_ttl.take(),
             password: self.password.take(),
+            tcp_ao: self.tcp_ao.take(),
         }
     }
 }
@@ -545,6 +554,22 @@ impl TryFrom<&api::Peer> for Peer {
         let mut builder = PeerBuilder::new(peer_addr);
         if !conf.auth_password.is_empty() {
             builder.password(&conf.auth_password);
+        }
+        // Handle TCP AO configuration
+        if let Some(tcp_ao) = &p.tcp_ao {
+            if tcp_ao.enabled && !tcp_ao.key.is_empty() {
+                let algorithm = match tcp_ao.algorithm.as_str() {
+                    "hmac-sha1-96" => auth::TcpAoAlgorithm::HmacSha1_96,
+                    _ => auth::TcpAoAlgorithm::CmacAes128, // default
+                };
+                let config = auth::TcpAoConfig::new(
+                    tcp_ao.key.clone(),
+                    tcp_ao.send_id as u8,
+                    tcp_ao.recv_id as u8,
+                )
+                .with_algorithm(algorithm);
+                builder.tcp_ao(config);
+            }
         }
         Ok(builder
             .local_asn(conf.local_asn)
@@ -842,7 +867,12 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<api::AddPeerResponse>, tonic::Status> {
         let peer = Peer::try_from(&request.into_inner().peer.ok_or(Error::EmptyArgument)?)?;
         let mut global = GLOBAL.write().await;
-        if let Some(password) = peer.password.as_ref() {
+        // Apply authentication to listen sockets: TCP AO takes precedence over MD5
+        if let Some(ref config) = peer.tcp_ao {
+            for fd in &global.listen_sockets {
+                let _ = auth::set_tcp_ao(*fd, &peer.remote_addr, config);
+            }
+        } else if let Some(password) = peer.password.as_ref() {
             for fd in &global.listen_sockets {
                 auth::set_md5sig(*fd, &peer.remote_addr, password);
             }
@@ -864,7 +894,12 @@ impl GoBgpService for GrpcService {
                         data: Vec::new(),
                     }));
                 }
-                if p.password.is_some() {
+                // Clear authentication from listen sockets
+                if p.tcp_ao.is_some() {
+                    for fd in &global.listen_sockets {
+                        let _ = auth::del_tcp_ao(*fd, &peer_addr, None, None);
+                    }
+                } else if p.password.is_some() {
                     for fd in &global.listen_sockets {
                         auth::set_md5sig(*fd, &peer_addr, "");
                     }
@@ -1898,13 +1933,17 @@ fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
     let sockaddr = std::net::SocketAddr::new(peer_addr, remote_port);
     let retry_time = peer.connect_retry_time;
     let password = peer.password.as_ref().map(|x| x.to_string());
+    let tcp_ao = peer.tcp_ao.clone();
     tokio::spawn(async move {
         loop {
             let socket = match peer_addr {
                 IpAddr::V4(_) => tokio::net::TcpSocket::new_v4().unwrap(),
                 IpAddr::V6(_) => tokio::net::TcpSocket::new_v6().unwrap(),
             };
-            if let Some(key) = password.as_ref() {
+            // Apply authentication: TCP AO takes precedence over MD5
+            if let Some(ref config) = tcp_ao {
+                let _ = auth::set_tcp_ao(socket.as_raw_fd(), &peer_addr, config);
+            } else if let Some(key) = password.as_ref() {
                 auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key);
             }
             if let Ok(Ok(stream)) = tokio::time::timeout(
@@ -2926,7 +2965,12 @@ impl Global {
             .append(&mut listen_sockets.iter().map(|x| x.as_raw_fd()).collect());
 
         for (addr, peer) in &GLOBAL.read().await.peers {
-            if let Some(password) = &peer.password {
+            // Apply authentication to listen sockets: TCP AO takes precedence over MD5
+            if let Some(ref config) = peer.tcp_ao {
+                for l in &listen_sockets {
+                    let _ = auth::set_tcp_ao(l.as_raw_fd(), addr, config);
+                }
+            } else if let Some(password) = &peer.password {
                 for l in &listen_sockets {
                     auth::set_md5sig(l.as_raw_fd(), addr, password);
                 }
