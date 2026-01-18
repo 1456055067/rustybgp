@@ -13,6 +13,81 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! BGP Session Authentication Module
+//!
+//! This module implements authentication mechanisms for BGP sessions including
+//! TCP MD5 Signature (RFC 2385) and TCP Authentication Option (RFC 5925).
+//!
+//! # NIST SP 800-53 Security Controls
+//!
+//! This module addresses the following NIST SP 800-53 Rev. 5 security controls:
+//!
+//! ## Identification and Authentication (IA) Family
+//!
+//! - **IA-3: Device Identification and Authentication**
+//!   Authenticates BGP peer devices before establishing sessions.
+//!   TCP-AO provides cryptographic device authentication using shared keys
+//!   and key identifiers unique to each peer relationship.
+//!
+//! - **IA-5: Authenticator Management**
+//!   Supports authenticator (key) management through:
+//!   - Configurable key values up to 80 bytes
+//!   - Key identifiers (send_id, recv_id) for key rollover support
+//!   - Algorithm selection for cryptographic strength requirements
+//!
+//! - **IA-7: Cryptographic Module Authentication**
+//!   Uses FIPS-validated cryptographic algorithms (AES-128-CMAC, HMAC-SHA1)
+//!   implemented in the Linux kernel cryptographic subsystem.
+//!
+//! - **IA-9: Service Identification and Authentication**
+//!   Authenticates the BGP routing service between peers, ensuring only
+//!   authorized routers can establish BGP sessions.
+//!
+//! ## System and Communications Protection (SC) Family
+//!
+//! - **SC-8: Transmission Confidentiality and Integrity**
+//!   Provides integrity protection for BGP session traffic. TCP-AO generates
+//!   MACs for each TCP segment, detecting tampering or injection attacks.
+//!   Note: TCP-AO provides integrity, not confidentiality.
+//!
+//! - **SC-12: Cryptographic Key Establishment and Management**
+//!   Supports key management through:
+//!   - Multiple key IDs per peer for key rollover without session disruption
+//!   - Separate send and receive key identifiers
+//!   - Key addition and deletion APIs for lifecycle management
+//!
+//! - **SC-13: Cryptographic Protection**
+//!   Implements NIST-approved cryptographic algorithms:
+//!   - AES-128-CMAC (FIPS 197, SP 800-38B) - Recommended default
+//!   - HMAC-SHA-1-96 (FIPS 180-4, RFC 2104) - Legacy compatibility
+//!
+//! - **SC-23: Session Authenticity**
+//!   Protects BGP session authenticity by:
+//!   - Authenticating each TCP segment with cryptographic MACs
+//!   - Binding authentication to specific peer IP addresses
+//!   - Preventing session hijacking and RST attacks
+//!
+//! ## Access Control (AC) Family
+//!
+//! - **AC-17: Remote Access**
+//!   Controls remote BGP peer connections by requiring valid authentication
+//!   credentials before session establishment. Unauthenticated connection
+//!   attempts are rejected at the TCP layer.
+//!
+//! ## Audit and Accountability (AU) Family
+//!
+//! - **AU-2: Event Logging** (Partial)
+//!   Functions return error codes that can be logged for security monitoring.
+//!   Integration with system logging is recommended for full compliance.
+//!
+//! # Security Considerations
+//!
+//! - TCP-AO (RFC 5925) supersedes TCP MD5 (RFC 2385) with improved security
+//! - Key length should be at least 16 bytes for adequate security
+//! - AES-128-CMAC is preferred over HMAC-SHA1-96 for new deployments
+//! - Keys should be rotated periodically using the key ID mechanism
+//! - Requires Linux kernel 5.18+ for TCP-AO support
+
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
 
@@ -79,16 +154,29 @@ pub(crate) fn set_md5sig(_rawfd: RawFd, _addr: &IpAddr, _key: &str) {}
 // TCP Authentication Option (RFC 5925)
 // Linux kernel support added in 5.18+
 
-/// TCP AO key configuration for BGP session authentication
+/// TCP AO key configuration for BGP session authentication.
+///
+/// # NIST Controls
+/// - **IA-3**: Device authentication configuration
+/// - **IA-5**: Authenticator (key) storage and management
+/// - **SC-12**: Key identifier management for key rollover
+/// - **SC-13**: Algorithm selection for cryptographic protection
 #[derive(Clone, Debug)]
 pub struct TcpAoConfig {
-    /// The shared secret key
+    /// The shared secret key.
+    /// NIST SC-12: Cryptographic key for session authentication.
+    /// Recommended minimum length: 16 bytes for adequate security.
     pub key: String,
-    /// Send key ID (0-255)
+    /// Send key ID (0-255).
+    /// NIST SC-12: Identifies the key used for outbound authentication,
+    /// enabling key rollover without session disruption.
     pub send_id: u8,
-    /// Receive key ID (0-255)
+    /// Receive key ID (0-255).
+    /// NIST SC-12: Identifies the key expected for inbound authentication,
+    /// supporting coordinated key rotation with peers.
     pub recv_id: u8,
-    /// Algorithm: "cmac-aes-128" or "hmac-sha1-96" (default: cmac-aes-128)
+    /// Algorithm: "cmac-aes-128" or "hmac-sha1-96" (default: cmac-aes-128).
+    /// NIST SC-13: Cryptographic algorithm selection.
     pub algorithm: TcpAoAlgorithm,
 }
 
@@ -108,12 +196,22 @@ impl TcpAoConfig {
     }
 }
 
-/// TCP AO algorithm options
+/// TCP AO algorithm options.
+///
+/// # NIST Controls
+/// - **SC-13**: NIST-approved cryptographic algorithms
+/// - **IA-7**: FIPS-validated cryptographic modules (when using kernel crypto)
+///
+/// Both algorithms are mandatory per RFC 5925 and use NIST-approved primitives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TcpAoAlgorithm {
-    /// AES-128-CMAC (recommended, default)
+    /// AES-128-CMAC (recommended, default).
+    /// NIST SC-13: FIPS 197 (AES) + SP 800-38B (CMAC).
+    /// Provides 128-bit security level.
     CmacAes128,
-    /// HMAC-SHA1-96
+    /// HMAC-SHA1-96.
+    /// NIST SC-13: FIPS 180-4 (SHA-1) + RFC 2104 (HMAC).
+    /// Truncated to 96 bits; provided for legacy compatibility.
     HmacSha1_96,
 }
 
@@ -311,7 +409,23 @@ impl TcpAoDel {
     }
 }
 
-/// Add a TCP AO key to the socket for the specified peer address
+/// Add a TCP AO key to the socket for the specified peer address.
+///
+/// # NIST Controls
+/// - **IA-3**: Enables device authentication for the specified peer
+/// - **IA-5**: Installs authenticator (key) for the peer relationship
+/// - **AC-17**: Establishes authentication requirement for remote BGP peer
+/// - **SC-8**: Enables integrity protection for the connection
+/// - **SC-23**: Establishes session authenticity mechanism
+///
+/// # Arguments
+/// * `rawfd` - Raw file descriptor of the TCP socket
+/// * `addr` - IP address of the remote BGP peer
+/// * `config` - TCP AO configuration including key and algorithm
+///
+/// # Returns
+/// * `Ok(())` on success
+/// * `Err(errno)` on failure (NIST AU-2: error for audit logging)
 #[cfg(target_os = "linux")]
 pub(crate) fn set_tcp_ao(rawfd: RawFd, addr: &IpAddr, config: &TcpAoConfig) -> Result<(), i32> {
     let s = TcpAoAdd::new(addr, config);
@@ -332,8 +446,24 @@ pub(crate) fn set_tcp_ao(rawfd: RawFd, addr: &IpAddr, config: &TcpAoConfig) -> R
     Ok(())
 }
 
-/// Remove a TCP AO key from the socket
-/// If send_id and recv_id are None, all keys for the address are removed
+/// Remove a TCP AO key from the socket.
+///
+/// # NIST Controls
+/// - **IA-5**: Authenticator lifecycle management (key removal/revocation)
+/// - **SC-12**: Cryptographic key management (key deletion)
+/// - **AC-17**: Revokes remote access authentication for peer
+///
+/// If send_id and recv_id are None, all keys for the address are removed.
+///
+/// # Arguments
+/// * `rawfd` - Raw file descriptor of the TCP socket
+/// * `addr` - IP address of the remote BGP peer
+/// * `send_id` - Optional send key ID to delete (None = all)
+/// * `recv_id` - Optional receive key ID to delete (None = all)
+///
+/// # Returns
+/// * `Ok(())` on success
+/// * `Err(errno)` on failure (NIST AU-2: error for audit logging)
 #[cfg(target_os = "linux")]
 pub(crate) fn del_tcp_ao(
     rawfd: RawFd,
