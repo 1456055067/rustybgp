@@ -41,6 +41,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::codec::{Decoder, Encoder, Framed};
+use uuid::Uuid;
 
 use api::go_bgp_service_server::{GoBgpService, GoBgpServiceServer};
 
@@ -1238,9 +1239,9 @@ impl GoBgpService for GrpcService {
         let u = self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
         let chan = TABLE[u.0].lock().await.table_event_tx[0].clone();
         let _ = chan.send(u.1);
-        // FIXME: support uuid
+        let uuid = Uuid::new_v4();
         Ok(tonic::Response::new(api::AddPathResponse {
-            uuid: Vec::new(),
+            uuid: uuid.as_bytes().to_vec(),
         }))
     }
     async fn delete_path(
