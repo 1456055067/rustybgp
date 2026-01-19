@@ -167,14 +167,17 @@ pub struct TcpAoConfig {
     /// The shared secret key.
     /// NIST SC-12: Cryptographic key for session authentication.
     /// Recommended minimum length: 16 bytes for adequate security.
+    #[allow(dead_code)]
     pub key: String,
     /// Send key ID (0-255).
     /// NIST SC-12: Identifies the key used for outbound authentication,
     /// enabling key rollover without session disruption.
+    #[allow(dead_code)]
     pub send_id: u8,
     /// Receive key ID (0-255).
     /// NIST SC-12: Identifies the key expected for inbound authentication,
     /// supporting coordinated key rotation with peers.
+    #[allow(dead_code)]
     pub recv_id: u8,
     /// Algorithm: "cmac-aes-128" or "hmac-sha1-96" (default: cmac-aes-128).
     /// NIST SC-13: Cryptographic algorithm selection.
@@ -204,11 +207,12 @@ impl TcpAoConfig {
 /// - **IA-7**: FIPS-validated cryptographic modules (when using kernel crypto)
 ///
 /// Both algorithms are mandatory per RFC 5925 and use NIST-approved primitives.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TcpAoAlgorithm {
     /// AES-128-CMAC (recommended, default).
     /// NIST SC-13: FIPS 197 (AES) + SP 800-38B (CMAC).
     /// Provides 128-bit security level.
+    #[default]
     CmacAes128,
     /// HMAC-SHA1-96.
     /// NIST SC-13: FIPS 180-4 (SHA-1) + RFC 2104 (HMAC).
@@ -218,6 +222,7 @@ pub enum TcpAoAlgorithm {
 
 impl TcpAoAlgorithm {
     /// Returns the algorithm name as expected by the kernel
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             TcpAoAlgorithm::CmacAes128 => "cmac(aes128)",
@@ -226,17 +231,12 @@ impl TcpAoAlgorithm {
     }
 
     /// Returns the MAC length for this algorithm
+    #[allow(dead_code)]
     pub fn maclen(&self) -> u8 {
         match self {
             TcpAoAlgorithm::CmacAes128 => 16,
             TcpAoAlgorithm::HmacSha1_96 => 12,
         }
-    }
-}
-
-impl Default for TcpAoAlgorithm {
-    fn default() -> Self {
-        TcpAoAlgorithm::CmacAes128
     }
 }
 
@@ -253,7 +253,8 @@ const TCP_AO_KEYF_IFINDEX: u8 = 0x01;
 const TCP_AO_KEYF_EXCLUDE_OPT: u8 = 0x02;
 
 // Maximum key length for TCP AO
-const TCP_AO_MAXKEYLEN: usize = 80;
+#[allow(dead_code)]
+pub(crate) const TCP_AO_MAXKEYLEN: usize = 80;
 
 /// Structure for adding a TCP AO key (matches Linux struct tcp_ao_add)
 #[cfg(target_os = "linux")]
@@ -494,7 +495,7 @@ pub(crate) fn del_tcp_ao(
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn set_tcp_ao(_rawfd: RawFd, _addr: &IpAddr, _config: &TcpAoConfig) -> Result<(), i32> {
     // TCP AO is only supported on Linux 5.18+
-    Ok(())
+    Err(libc::ENOTSUP)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -505,5 +506,5 @@ pub(crate) fn del_tcp_ao(
     _recv_id: Option<u8>,
 ) -> Result<(), i32> {
     // TCP AO is only supported on Linux 5.18+
-    Ok(())
+    Err(libc::ENOTSUP)
 }

@@ -24,6 +24,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::convert::{From, TryFrom};
 use std::hash::{Hash, Hasher};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::os::fd::AsFd;
@@ -556,20 +557,38 @@ impl TryFrom<&api::Peer> for Peer {
             builder.password(&conf.auth_password);
         }
         // Handle TCP AO configuration
-        if let Some(tcp_ao) = &p.tcp_ao {
-            if tcp_ao.enabled && !tcp_ao.key.is_empty() {
-                let algorithm = match tcp_ao.algorithm.as_str() {
-                    "hmac-sha1-96" => auth::TcpAoAlgorithm::HmacSha1_96,
-                    _ => auth::TcpAoAlgorithm::CmacAes128, // default
-                };
-                let config = auth::TcpAoConfig::new(
-                    tcp_ao.key.clone(),
-                    tcp_ao.send_id as u8,
-                    tcp_ao.recv_id as u8,
-                )
-                .with_algorithm(algorithm);
-                builder.tcp_ao(config);
+        if let Some(tcp_ao) = &p.tcp_ao
+            && tcp_ao.enabled
+            && !tcp_ao.key.is_empty()
+        {
+            if tcp_ao.send_id > u8::MAX as u32 {
+                return Err(Error::InvalidArgument(
+                    "tcp_ao.send_id must be between 0 and 255".to_string(),
+                ));
             }
+            if tcp_ao.recv_id > u8::MAX as u32 {
+                return Err(Error::InvalidArgument(
+                    "tcp_ao.recv_id must be between 0 and 255".to_string(),
+                ));
+            }
+            let key_len = tcp_ao.key.len();
+            if key_len > auth::TCP_AO_MAXKEYLEN {
+                return Err(Error::InvalidArgument(format!(
+                    "tcp_ao.key exceeds max length of {} bytes",
+                    auth::TCP_AO_MAXKEYLEN
+                )));
+            }
+            let algorithm = match tcp_ao.algorithm.as_str() {
+                "hmac-sha1-96" => auth::TcpAoAlgorithm::HmacSha1_96,
+                _ => auth::TcpAoAlgorithm::CmacAes128, // default
+            };
+            let config = auth::TcpAoConfig::new(
+                tcp_ao.key.clone(),
+                tcp_ao.send_id as u8,
+                tcp_ao.recv_id as u8,
+            )
+            .with_algorithm(algorithm);
+            builder.tcp_ao(config);
         }
         Ok(builder
             .local_asn(conf.local_asn)
@@ -867,7 +886,16 @@ impl GoBgpService for GrpcService {
         // Apply authentication to listen sockets: TCP AO takes precedence over MD5
         if let Some(ref config) = peer.tcp_ao {
             for fd in &global.listen_sockets {
-                let _ = auth::set_tcp_ao(*fd, &peer.remote_addr, config);
+                if let Err(errno) = auth::set_tcp_ao(*fd, &peer.remote_addr, config) {
+                    return Err(tonic::Status::new(
+                        tonic::Code::FailedPrecondition,
+                        format!(
+                            "tcp_ao setup failed for {}: {}",
+                            peer.remote_addr,
+                            io::Error::from_raw_os_error(errno)
+                        ),
+                    ));
+                }
             }
         } else if let Some(password) = peer.password.as_ref() {
             for fd in &global.listen_sockets {
@@ -1939,7 +1967,9 @@ fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
             };
             // Apply authentication: TCP AO takes precedence over MD5
             if let Some(ref config) = tcp_ao {
-                let _ = auth::set_tcp_ao(socket.as_raw_fd(), &peer_addr, config);
+                if auth::set_tcp_ao(socket.as_raw_fd(), &peer_addr, config).is_err() {
+                    return;
+                }
             } else if let Some(key) = password.as_ref() {
                 auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key);
             }
@@ -2964,7 +2994,13 @@ impl Global {
             // Apply authentication to listen sockets: TCP AO takes precedence over MD5
             if let Some(ref config) = peer.tcp_ao {
                 for l in &listen_sockets {
-                    let _ = auth::set_tcp_ao(l.as_raw_fd(), addr, config);
+                    if let Err(errno) = auth::set_tcp_ao(l.as_raw_fd(), addr, config) {
+                        panic!(
+                            "tcp_ao setup failed for {}: {}",
+                            addr,
+                            io::Error::from_raw_os_error(errno)
+                        );
+                    }
                 }
             } else if let Some(password) = &peer.password {
                 for l in &listen_sockets {
