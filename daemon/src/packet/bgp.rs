@@ -69,13 +69,13 @@ impl From<Family> for api::Family {
     }
 }
 
-impl TryFrom<&config::gen::AfiSafiType> for Family {
+impl TryFrom<&config::generate::AfiSafiType> for Family {
     type Error = ();
 
-    fn try_from(f: &config::gen::AfiSafiType) -> Result<Self, Self::Error> {
+    fn try_from(f: &config::generate::AfiSafiType) -> Result<Self, Self::Error> {
         match f {
-            config::gen::AfiSafiType::Ipv4Unicast => Ok(Family::IPV4),
-            config::gen::AfiSafiType::Ipv6Unicast => Ok(Family::IPV6),
+            config::generate::AfiSafiType::Ipv4Unicast => Ok(Family::IPV4),
+            config::generate::AfiSafiType::Ipv6Unicast => Ok(Family::IPV6),
             _ => Err(()),
         }
     }
@@ -1834,19 +1834,19 @@ impl Codec {
                 let pos_withdrawn_len = dst.len();
                 dst.put_u16(0);
                 let mut withdrawn_len = 0;
-                if family == Family::IPV4 {
-                    if let Some(unreach) = unreach {
-                        let max_len = 5 + if addpath { 4 } else { 0 };
-                        for (i, item) in unreach.1.iter().enumerate().skip(*reach_idx) {
-                            if pos_head + self.max_message_length() > dst.len() + max_len {
-                                if addpath {
-                                    dst.put_u32(item.1);
-                                }
-                                withdrawn_len += item.0.encode(dst).unwrap();
-                                *reach_idx = i;
-                            } else {
-                                break;
+                if family == Family::IPV4
+                    && let Some(unreach) = unreach
+                {
+                    let max_len = 5 + if addpath { 4 } else { 0 };
+                    for (i, item) in unreach.1.iter().enumerate().skip(*reach_idx) {
+                        if pos_head + self.max_message_length() > dst.len() + max_len {
+                            if addpath {
+                                dst.put_u32(item.1);
                             }
+                            withdrawn_len += item.0.encode(dst).unwrap();
+                            *reach_idx = i;
+                        } else {
+                            break;
                         }
                     }
                 }

@@ -93,6 +93,7 @@ use std::os::unix::io::RawFd;
 
 // TCP MD5 Signature Option (RFC 2385)
 #[repr(C)]
+#[allow(dead_code)]
 struct TcpMd5sig {
     ss_family: u16,
     ss: [u8; 126],
@@ -101,7 +102,7 @@ struct TcpMd5sig {
     _pad1: u32,
     key: [u8; 80],
 }
-
+#[allow(dead_code)]
 impl TcpMd5sig {
     fn new(addr: &IpAddr, password: String) -> TcpMd5sig {
         let mut ss = [0; 126];

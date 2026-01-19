@@ -31,7 +31,7 @@ use std::time::SystemTime;
 
 use crate::api;
 use crate::error::Error;
-use crate::packet::{self, bgp, Attribute, Family};
+use crate::packet::{self, Attribute, Family, bgp};
 
 struct PathAttribute {
     attr: Arc<Vec<Attribute>>,
@@ -363,11 +363,7 @@ impl RoutingTable {
                                     .cloned()
                                     .map(|a| {
                                         let (_, m) = a.export(a.code(), None, family, &codec);
-                                        if let Some(m) = m {
-                                            m
-                                        } else {
-                                            a
-                                        }
+                                        if let Some(m) = m { m } else { a }
                                     })
                                     .collect::<Vec<packet::Attribute>>(),
                             );
@@ -1079,15 +1075,17 @@ impl Condition {
             Condition::Prefix(_name, opt, set) => {
                 match net {
                     packet::Net::V4(n) => {
-                        if let Some(zero) = set.zero {
-                            if zero.0 <= n.mask && n.mask <= zero.1 {
-                                return *opt == MatchOption::Any;
-                            }
+                        if let Some(zero) = set.zero
+                            && zero.0 <= n.mask
+                            && n.mask <= zero.1
+                        {
+                            return *opt == MatchOption::Any;
                         }
-                        if let Some((_, _, p)) = set.v4.longest_match(n.addr) {
-                            if p.min_length <= n.mask && p.max_length <= n.mask {
-                                return *opt == MatchOption::Any;
-                            }
+                        if let Some((_, _, p)) = set.v4.longest_match(n.addr)
+                            && p.min_length <= n.mask
+                            && p.max_length <= n.mask
+                        {
+                            return *opt == MatchOption::Any;
                         }
                         return !(*opt == MatchOption::Any);
                     }
@@ -1185,10 +1183,8 @@ impl Statement {
             }
         }
 
-        if result {
-            if let Some(disposition) = &self.disposition {
-                return *disposition;
-            }
+        if result && let Some(disposition) = &self.disposition {
+            return *disposition;
         }
         Disposition::Pass
     }
@@ -1486,10 +1482,10 @@ impl PolicyTable {
             if let Some(a) = self.assignment_import.as_ref() {
                 v.push(a.to_api(1));
             }
-        } else if direction != 1 {
-            if let Some(a) = self.assignment_export.as_ref() {
-                v.push(a.to_api(2));
-            }
+        } else if direction != 1
+            && let Some(a) = self.assignment_export.as_ref()
+        {
+            v.push(a.to_api(2));
         }
         v.into_iter()
     }
@@ -1558,7 +1554,7 @@ impl PolicyTable {
                                 return Err(Error::InvalidArgument(format!(
                                     "invalid prefix format {:?}",
                                     p.ip_prefix
-                                )))
+                                )));
                             }
                         }
                     }
@@ -1686,7 +1682,7 @@ impl PolicyTable {
                         return Err(Error::InvalidArgument(format!(
                             "{} prefix-set isn't found",
                             m.name
-                        )))
+                        )));
                     }
                 }
             }
@@ -1703,7 +1699,7 @@ impl PolicyTable {
                         return Err(Error::InvalidArgument(format!(
                             "{} neighbor-set isn't found",
                             m.name
-                        )))
+                        )));
                     }
                 }
             }
@@ -1715,7 +1711,7 @@ impl PolicyTable {
                         return Err(Error::InvalidArgument(format!(
                             "{} aspath-set isn't found",
                             m.name
-                        )))
+                        )));
                     }
                 }
             }
@@ -1730,7 +1726,7 @@ impl PolicyTable {
                         return Err(Error::InvalidArgument(format!(
                             "{} community-set isn't found",
                             m.name
-                        )))
+                        )));
                     }
                 }
             }
@@ -1751,7 +1747,7 @@ impl PolicyTable {
                 match api::ValidationState::try_from(conditions.rpki_result) {
                     Ok(s) => v.push(Condition::Rpki(s)),
                     Err(_) => {
-                        return Err(Error::InvalidArgument("invalid rpki condition".to_string()))
+                        return Err(Error::InvalidArgument("invalid rpki condition".to_string()));
                     }
                 }
             }
