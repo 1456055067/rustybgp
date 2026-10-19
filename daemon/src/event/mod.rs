@@ -217,6 +217,10 @@ pub(super) enum CloseReason {
     /// Graceful Restart: the remote peer detects the silent close and enters
     /// helper mode).
     Silent,
+    /// The peer restarted and opened a new connection while this session was
+    /// still Established (RFC 4724 §4.2): close without a NOTIFICATION and
+    /// treat it like a TCP failure, so GR helper mode retains the routes.
+    PeerRestarted,
 }
 
 impl ConnArbiter {
@@ -1726,21 +1730,13 @@ impl Global {
                         }
                     }
                     stream = bgp_listen_futures.fuse() => {
-                        if let Some(Some(Ok(stream))) = stream
-                            && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Passive).await
-                        {
-                            let arb = h.conn_arbiter.clone();
-                            let join_handle = tokio::spawn(h.run(global.clone(), active_tx.clone()));
-                            arb.lock().unwrap().passive_join_handle = Some(join_handle);
+                        if let Some(Some(Ok(stream))) = stream {
+                            accept_and_spawn(&global, &tables, stream, crate::fsm::Role::Passive, &active_tx).await;
                         }
                     }
                     stream = active_rx.recv().fuse() => {
-                        if let Some(stream) = stream
-                            && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Active).await
-                        {
-                            let arb = h.conn_arbiter.clone();
-                            let join_handle = tokio::spawn(h.run(global.clone(), active_tx.clone()));
-                            arb.lock().unwrap().active_join_handle = Some(join_handle);
+                        if let Some(stream) = stream {
+                            accept_and_spawn(&global, &tables, stream, crate::fsm::Role::Active, &active_tx).await;
                         }
                     }
                     _ = (&mut stop_rx).fuse() => { break }
@@ -1751,6 +1747,87 @@ impl Global {
             global.write().await.listen_sockets.clear();
         }
     }
+}
+
+/// How long a new connection from a restarted peer waits for the previous
+/// session to finish tearing down before it is accepted (or refused).
+const RESTART_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Accept `stream` and spawn its session task.
+///
+/// If the peer still has an Established session with GR negotiated, the new
+/// connection means the peer restarted (RFC 4724 §4.2): the old session is
+/// closed with its routes retained, and the new connection is accepted once
+/// the old session's task has finished, so the two never share the peer's
+/// RIB registration.
+async fn accept_and_spawn(
+    global: &GlobalHandle,
+    tables: &TableHandle,
+    stream: TcpStream,
+    role: crate::fsm::Role,
+    active_tx: &mpsc::UnboundedSender<TcpStream>,
+) {
+    let old_session = match stream.peer_addr() {
+        Ok(addr) => close_restarted_session(global, addr.ip()).await,
+        Err(_) => None,
+    };
+    let restarting = old_session.is_some();
+    let global = global.clone();
+    let tables = tables.clone();
+    let active_tx = active_tx.clone();
+    let accept = async move {
+        if let Some(old) = old_session
+            && tokio::time::timeout(RESTART_TEARDOWN_TIMEOUT, old)
+                .await
+                .is_err()
+        {
+            log::warn!("previous session didn't close in time; new connection may be refused");
+        }
+        if let Some(h) = accept_connection(&global, &tables, stream, role).await {
+            let arb = h.conn_arbiter.clone();
+            let join_handle = tokio::spawn(h.run(global.clone(), active_tx));
+            let mut arb = arb.lock().unwrap();
+            match role {
+                crate::fsm::Role::Active => arb.active_join_handle = Some(join_handle),
+                crate::fsm::Role::Passive => arb.passive_join_handle = Some(join_handle),
+            }
+        }
+    };
+    if restarting {
+        // Don't stall the event loop while the old session tears down.
+        tokio::spawn(accept);
+    } else {
+        accept.await;
+    }
+}
+
+/// If `remote_addr`'s previous session is still Established with GR
+/// negotiated, tell it the peer restarted and return its task handle.
+async fn close_restarted_session(
+    global: &GlobalHandle,
+    remote_addr: IpAddr,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let g = global.read().await;
+    let peer = g.peers.get(&remote_addr)?;
+    if peer.admin_down {
+        return None;
+    }
+    let remote_cap = peer.state.remote_cap.load_full()?;
+    let ctx = peer.context.lock().unwrap();
+    let mut arb = ctx.conn_arbiter.lock().unwrap();
+    let role = arb.fsm().gr_restart_role(&remote_cap)?;
+    // Without the task handle there is no way to wait for the teardown; leave
+    // the session alone and let the usual duplicate-connection check apply.
+    let arb = &mut *arb;
+    let (close_tx, join_handle) = match role {
+        crate::fsm::Role::Active => (&mut arb.active_close_tx, &mut arb.active_join_handle),
+        crate::fsm::Role::Passive => (&mut arb.passive_close_tx, &mut arb.passive_join_handle),
+    };
+    join_handle.as_ref()?;
+    let tx = close_tx.take()?;
+    log::info!("{remote_addr}: new connection while Established with GR; treating as restart");
+    let _ = tx.send(CloseReason::PeerRestarted);
+    join_handle.take()
 }
 
 async fn accept_connection(
@@ -3840,6 +3917,10 @@ impl PeerSession {
                         // Close TCP without sending a NOTIFICATION so the remote
                         // peer treats this as a GR restart event.
                         return Step::Terminate { reason: crate::fsm::SessionDownReason::AdminShutdown, notification: None };
+                    }
+                    Some(Ok(CloseReason::PeerRestarted)) => {
+                        log::info!("{}: peer restarted, closing previous session", self.remote_addr);
+                        return Step::Terminate { reason: crate::fsm::SessionDownReason::IoError, notification: None };
                     }
                     _ => {}
                 }
@@ -7799,6 +7880,92 @@ local-address = "{local}"
             Some(llgr),
         );
         assert!(gr.is_some() && llgr.is_some());
+    }
+
+    /// Add a GR-enabled peer whose passive session is Established, with a
+    /// live close channel and task handle.  Returns the close receiver.
+    async fn established_gr_peer(
+        global: &GlobalHandle,
+        remote_addr: IpAddr,
+        peer_sends_gr: bool,
+    ) -> tokio::sync::oneshot::Receiver<CloseReason> {
+        let mut params = default_peer_params(remote_addr);
+        params.expected_remote_asn = 65002;
+        params.local_asn = 65001;
+        params.graceful_restart = Some(GrPeerConfig {
+            restart_time: 120,
+            notification_enabled: false,
+            families: vec![Family::IPV4],
+        });
+        let mut g = global.write().await;
+        g.add_peer(params, None).unwrap();
+        let peer = g.peers.get(&remote_addr).unwrap();
+        let mut caps = vec![
+            packet::Capability::MultiProtocol(Family::IPV4),
+            packet::Capability::FourOctetAsNumber(65002),
+        ];
+        if peer_sends_gr {
+            caps.push(packet::Capability::GracefulRestart {
+                flags: 0,
+                restart_time: 90,
+                families: vec![(Family::IPV4, 0x80)],
+            });
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let ctx = peer.context.lock().unwrap();
+            let mut arb = ctx.conn_arbiter.lock().unwrap();
+            let role = crate::fsm::Role::Passive;
+            arb.process(role, crate::fsm::Input::Connected(false));
+            arb.process(
+                role,
+                crate::fsm::Input::MessageReceived(bgp::Message::Open(bgp::Open {
+                    as_number: 65002,
+                    holdtime: HoldTime::new(90).unwrap(),
+                    router_id: u32::from(Ipv4Addr::new(2, 2, 2, 2)),
+                    capability: caps.clone(),
+                })),
+            );
+            arb.process(
+                role,
+                crate::fsm::Input::MessageReceived(bgp::Message::Keepalive),
+            );
+            assert_eq!(arb.state(role), crate::fsm::State::Established);
+            arb.passive_close_tx = Some(tx);
+            arb.passive_join_handle = Some(tokio::spawn(async {}));
+        }
+        peer.state.remote_cap.store(Some(Arc::new(caps)));
+        rx
+    }
+
+    #[tokio::test]
+    async fn new_connection_while_established_with_gr_closes_old_session() {
+        // RFC 4724 §4.2: the old session is closed as a restart, not refused.
+        let global = make_global();
+        let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
+        let mut close_rx = established_gr_peer(&global, remote_addr, true).await;
+
+        let old = close_restarted_session(&global, remote_addr).await;
+
+        assert!(old.is_some(), "old session's task handle must be returned");
+        assert!(matches!(
+            close_rx.try_recv(),
+            Ok(CloseReason::PeerRestarted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn new_connection_while_established_without_gr_leaves_old_session() {
+        let global = make_global();
+        let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
+        let mut close_rx = established_gr_peer(&global, remote_addr, false).await;
+
+        assert!(
+            close_restarted_session(&global, remote_addr)
+                .await
+                .is_none()
+        );
+        assert!(close_rx.try_recv().is_err());
     }
 
     // After a session ends via EOF the FSM Connection slot must be cleared

@@ -504,6 +504,26 @@ impl PeerFsm {
             .unwrap_or(State::Idle)
     }
 
+    /// RFC 4724 §4.2: when the peer opens a new connection while its previous
+    /// session is still Established, and Graceful Restart was negotiated on
+    /// that session, the peer has restarted.  Returns the role of the old
+    /// session, which must be closed (retaining its routes) so the new
+    /// connection can take over.
+    ///
+    /// `remote_cap` is the capability list the peer sent for that session.
+    pub(crate) fn gr_restart_role(&self, remote_cap: &[Capability]) -> Option<Role> {
+        let has_gr = |caps: &[Capability]| {
+            caps.iter()
+                .any(|c| matches!(c, Capability::GracefulRestart { .. }))
+        };
+        if !has_gr(&self.local_cap) || !has_gr(remote_cap) {
+            return None;
+        }
+        [Role::Active, Role::Passive]
+            .into_iter()
+            .find(|&r| self.state(r) == State::Established)
+    }
+
     /// Mutable reference to the Connection for the given role.
     fn connection_mut(&mut self, role: Role) -> Option<&mut Connection> {
         match role {
@@ -1488,6 +1508,66 @@ mod tests {
             peer.connection(Role::Passive).unwrap().state(),
             State::Established
         );
+    }
+
+    fn gr_cap() -> Capability {
+        Capability::GracefulRestart {
+            flags: 0,
+            restart_time: 120,
+            families: vec![(Family::IPV4, 0x80)],
+        }
+    }
+
+    fn established_passive(local_cap: Vec<Capability>) -> PeerFsm {
+        let mut peer = PeerFsm::new(
+            local_router_id(),
+            65001,
+            local_cap,
+            90,
+            65002,
+            FnvHashMap::default(),
+        );
+        connect(&mut peer, Role::Passive);
+        peer.process(
+            Role::Passive,
+            Input::MessageReceived(remote_open_msg(65002, remote_router_id())),
+        );
+        peer.process(
+            Role::Passive,
+            Input::MessageReceived(bgp::Message::Keepalive),
+        );
+        assert_eq!(peer.state(Role::Passive), State::Established);
+        peer
+    }
+
+    #[test]
+    fn gr_restart_role_finds_established_session_when_gr_negotiated() {
+        let peer = established_passive(vec![Capability::MultiProtocol(Family::IPV4), gr_cap()]);
+        assert_eq!(peer.gr_restart_role(&[gr_cap()]), Some(Role::Passive));
+    }
+
+    #[test]
+    fn gr_restart_role_none_without_gr() {
+        // Peer didn't advertise GR on the old session.
+        let peer = established_passive(vec![Capability::MultiProtocol(Family::IPV4), gr_cap()]);
+        assert_eq!(peer.gr_restart_role(&[]), None);
+        // We didn't advertise GR.
+        let peer = established_passive(vec![Capability::MultiProtocol(Family::IPV4)]);
+        assert_eq!(peer.gr_restart_role(&[gr_cap()]), None);
+    }
+
+    #[test]
+    fn gr_restart_role_none_when_not_established() {
+        let mut peer = PeerFsm::new(
+            local_router_id(),
+            65001,
+            vec![gr_cap()],
+            90,
+            65002,
+            FnvHashMap::default(),
+        );
+        connect(&mut peer, Role::Passive);
+        assert_eq!(peer.gr_restart_role(&[gr_cap()]), None);
     }
 
     #[test]
