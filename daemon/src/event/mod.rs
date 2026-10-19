@@ -2071,6 +2071,28 @@ fn gr_on_disconnect(
     if applies { Some(gr) } else { None }
 }
 
+/// Filter the negotiated GR/LLGR state down to what survives this disconnect.
+///
+/// GR follows [`gr_on_disconnect`].  LLGR follows the same rules (RFC 9494
+/// §4.2): it applies when GR does, or on a plain TCP drop when GR wasn't
+/// negotiated.  Anything returned as `None` here means the peer's routes for
+/// those families must be flushed rather than retained as stale.
+fn gr_eligible_on_disconnect(
+    shutdown: &Option<crate::fsm::SessionDownReason>,
+    gr: Option<NegotiatedGr>,
+    llgr: Option<NegotiatedLlgr>,
+) -> (Option<NegotiatedGr>, Option<NegotiatedLlgr>) {
+    let gr = gr.and_then(|gr| gr_on_disconnect(shutdown, gr));
+    let llgr = llgr.filter(|_| {
+        gr.is_some()
+            || matches!(
+                shutdown,
+                None | Some(crate::fsm::SessionDownReason::IoError)
+            )
+    });
+    (gr, llgr)
+}
+
 /// Apply outputs from [`crate::gr::RestartingDeferral::process`].
 ///
 /// Handles FamilyDeferralComplete and EndDeferral immediately.
@@ -3868,14 +3890,22 @@ impl PeerSession {
 
         let shutdown_reason = Some(reason);
 
+        // Decide GR/LLGR eligibility before touching the RIB: a disconnect that
+        // doesn't qualify (e.g. Cease without the N-bit, Hard Reset, a local
+        // UPDATE error) must flush the peer's routes, not mark them stale.
+        let (negotiated_gr, negotiated_llgr) = gr_eligible_on_disconnect(
+            &shutdown_reason,
+            self.negotiated_gr.take(),
+            self.negotiated_llgr.take(),
+        );
+
         if !self.source.is_empty() {
             let drop_families = families_to_drop_on_disconnect(
                 self.source.keys(),
-                self.negotiated_gr.as_ref(),
-                self.negotiated_llgr.as_ref(),
+                negotiated_gr.as_ref(),
+                negotiated_llgr.as_ref(),
             );
-            let stale_families: Vec<Family> = self
-                .negotiated_gr
+            let stale_families: Vec<Family> = negotiated_gr
                 .as_ref()
                 .map(|g| g.families.clone())
                 .unwrap_or_default();
@@ -3894,20 +3924,8 @@ impl PeerSession {
             });
         }
         disconnect.export_map = std::mem::take(&mut self.export_map);
-
-        disconnect.negotiated_gr = self
-            .negotiated_gr
-            .take()
-            .and_then(|gr| gr_on_disconnect(&shutdown_reason, gr));
-        // LLGR follows the same eligibility rules as GR (RFC 9494 §4.2).
-        if disconnect.negotiated_gr.is_some()
-            || matches!(
-                shutdown_reason,
-                None | Some(crate::fsm::SessionDownReason::IoError)
-            )
-        {
-            disconnect.negotiated_llgr = self.negotiated_llgr.take();
-        }
+        disconnect.negotiated_gr = negotiated_gr;
+        disconnect.negotiated_llgr = negotiated_llgr;
         disconnect
     }
 
@@ -4068,8 +4086,12 @@ async fn apply_disconnect(
         // from the RIB in session_loop().  The next session must also send a
         // full update, so the export_map is discarded here and the next
         // session starts with an empty one.  Clean up any leftover GR state
-        // from a previous cycle that never recovered.
+        // from a previous cycle that never recovered: every route from the
+        // peer is gone, so nothing is left for a restart/LLGR timer or a
+        // pending EOR to clean up.
         ctx.cancel_gr_timer();
+        ctx.cancel_llgr_timers();
+        ctx.gr_state = crate::gr::GrState::new();
         // RTC: complete drop -- reset state to Inactive and cancel timer.
         ctx.rtc_state.process(crate::rtc::RtcInput::SessionDropped);
         ctx.cancel_rtc_timer();
@@ -7441,6 +7463,68 @@ local-address = "{local}"
         };
         let result = families_to_drop_on_disconnect(families.iter(), Some(&gr), Some(&llgr));
         assert!(result.is_empty());
+    }
+
+    fn gr_llgr_for_ipv4(notification_enabled: bool) -> (NegotiatedGr, NegotiatedLlgr) {
+        (
+            NegotiatedGr {
+                families: vec![Family::IPV4],
+                restart_time: Duration::from_secs(90),
+                notification_enabled,
+            },
+            NegotiatedLlgr {
+                families: vec![(Family::IPV4, Duration::from_secs(600))],
+            },
+        )
+    }
+
+    #[test]
+    fn ineligible_disconnect_flushes_gr_families() {
+        // GR negotiated without the N-bit, session ended by a Cease: GR does not
+        // apply, so the family must be dropped instead of being marked stale.
+        let (gr, llgr) = gr_llgr_for_ipv4(false);
+        let cease = Some(crate::fsm::SessionDownReason::RemoteNotification(
+            bgp::Message::Notification(rustybgp_packet::Notification::CeaseAdminShutdown),
+        ));
+        let (gr, llgr) = gr_eligible_on_disconnect(&cease, Some(gr), Some(llgr));
+        assert!(gr.is_none());
+        assert!(llgr.is_none());
+        let families = [Family::IPV4];
+        assert_eq!(
+            families_to_drop_on_disconnect(families.iter(), gr.as_ref(), llgr.as_ref()),
+            vec![Family::IPV4]
+        );
+    }
+
+    #[test]
+    fn hard_reset_flushes_even_with_n_bit() {
+        let (gr, llgr) = gr_llgr_for_ipv4(true);
+        let hard_reset = Some(crate::fsm::SessionDownReason::RemoteNotification(
+            bgp::Message::Notification(rustybgp_packet::Notification::CeaseHardReset),
+        ));
+        let (gr, llgr) = gr_eligible_on_disconnect(&hard_reset, Some(gr), Some(llgr));
+        assert!(gr.is_none() && llgr.is_none());
+    }
+
+    #[test]
+    fn local_update_error_flushes() {
+        let (gr, llgr) = gr_llgr_for_ipv4(true);
+        let err = Some(crate::fsm::SessionDownReason::LocalNotification(
+            bgp::Message::Notification(rustybgp_packet::Notification::UpdateMalformedAttributeList),
+        ));
+        let (gr, llgr) = gr_eligible_on_disconnect(&err, Some(gr), Some(llgr));
+        assert!(gr.is_none() && llgr.is_none());
+    }
+
+    #[test]
+    fn tcp_drop_keeps_gr_and_llgr() {
+        let (gr, llgr) = gr_llgr_for_ipv4(false);
+        let (gr, llgr) = gr_eligible_on_disconnect(
+            &Some(crate::fsm::SessionDownReason::IoError),
+            Some(gr),
+            Some(llgr),
+        );
+        assert!(gr.is_some() && llgr.is_some());
     }
 
     // After a session ends via EOF the FSM Connection slot must be cleared
@@ -11799,6 +11883,33 @@ local-address = "{local}"
         let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
         let info = make_disconnect_info(None);
         apply_disconnect(&context, remote_addr, &tables, info).await;
+    }
+
+    #[tokio::test]
+    async fn non_gr_disconnect_resets_leftover_gr_state() {
+        // A previous GR cycle is still waiting for EOR when the new session
+        // drops without qualifying for GR: every route from the peer is
+        // flushed, so the helper must not keep waiting on the old cycle.
+        let tables = make_tables();
+        let context = make_context();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        {
+            let mut ctx = context.lock().unwrap();
+            ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
+                gr: Some(crate::gr::GrParams {
+                    families: vec![Family::IPV4],
+                    restart_time: Duration::from_secs(90),
+                }),
+                llgr: None,
+            });
+            ctx.gr_state
+                .process(crate::gr::GrInput::SessionEstablished {
+                    gr_families: vec![Family::IPV4],
+                });
+            assert!(ctx.gr_state.is_peer_restarting());
+        }
+        apply_disconnect(&context, remote_addr, &tables, make_disconnect_info(None)).await;
+        assert!(!context.lock().unwrap().gr_state.is_peer_restarting());
     }
 
     // --- build_local_cap tests ---
