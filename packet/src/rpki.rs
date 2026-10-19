@@ -55,9 +55,102 @@ pub enum Message {
     },
     CacheReset,
     ErrorReport {
-        /// Error code from RFC 8210 section 10.
+        /// Error code from RFC 8210 section 12.
         error_code: u16,
+        /// Copy of the erroneous PDU, if any.
+        pdu: Vec<u8>,
+        /// Diagnostic text, if any.
+        text: String,
     },
+}
+
+/// Error codes carried in Error Report PDUs (RFC 8210 section 12).
+pub mod error_code {
+    pub const CORRUPT_DATA: u16 = 0;
+    pub const INTERNAL_ERROR: u16 = 1;
+    pub const NO_DATA_AVAILABLE: u16 = 2;
+    pub const INVALID_REQUEST: u16 = 3;
+    pub const UNSUPPORTED_PROTOCOL_VERSION: u16 = 4;
+    pub const UNSUPPORTED_PDU_TYPE: u16 = 5;
+    pub const WITHDRAWAL_OF_UNKNOWN_RECORD: u16 = 6;
+    pub const DUPLICATE_ANNOUNCEMENT_RECEIVED: u16 = 7;
+    pub const UNEXPECTED_PROTOCOL_VERSION: u16 = 8;
+
+    /// Human-readable name of an error code.
+    pub fn name(code: u16) -> &'static str {
+        match code {
+            CORRUPT_DATA => "Corrupt Data",
+            INTERNAL_ERROR => "Internal Error",
+            NO_DATA_AVAILABLE => "No Data Available",
+            INVALID_REQUEST => "Invalid Request",
+            UNSUPPORTED_PROTOCOL_VERSION => "Unsupported Protocol Version",
+            UNSUPPORTED_PDU_TYPE => "Unsupported PDU Type",
+            WITHDRAWAL_OF_UNKNOWN_RECORD => "Withdrawal of Unknown Record",
+            DUPLICATE_ANNOUNCEMENT_RECEIVED => "Duplicate Announcement Received",
+            UNEXPECTED_PROTOCOL_VERSION => "Unexpected Protocol Version",
+            _ => "Unknown",
+        }
+    }
+}
+
+/// A protocol error detected while decoding a PDU from the cache. Carries
+/// what is needed to answer with an Error Report (RFC 8210 section 5.11).
+#[derive(Debug)]
+pub struct RtrError {
+    pub code: u16,
+    /// Copy of the offending PDU (or as much of it as is known).
+    pub pdu: Vec<u8>,
+    pub text: String,
+}
+
+impl RtrError {
+    fn new(code: u16, pdu: &[u8], text: String) -> Self {
+        RtrError {
+            code,
+            pdu: pdu.to_vec(),
+            text,
+        }
+    }
+
+    /// The Error Report to send back to the cache, or `None` when the
+    /// offending PDU was itself an Error Report, which MUST NOT be answered
+    /// with another (RFC 8210 section 5.11).
+    pub fn report(&self) -> Option<Message> {
+        if self.pdu.get(1) == Some(&Message::ERROR_REPORT)
+            || self.code == error_code::INTERNAL_ERROR
+        {
+            return None;
+        }
+        Some(Message::ErrorReport {
+            error_code: self.code,
+            pdu: self.pdu.clone(),
+            text: self.text.clone(),
+        })
+    }
+}
+
+impl std::fmt::Display for RtrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({}): {}",
+            error_code::name(self.code),
+            self.code,
+            self.text
+        )
+    }
+}
+
+impl std::error::Error for RtrError {}
+
+impl From<std::io::Error> for RtrError {
+    fn from(e: std::io::Error) -> Self {
+        RtrError {
+            code: error_code::INTERNAL_ERROR,
+            pdu: Vec::new(),
+            text: e.to_string(),
+        }
+    }
 }
 
 impl Message {
@@ -72,6 +165,8 @@ impl Message {
     pub const ROUTER_KEY: u8 = 9;
     pub const ERROR_REPORT: u8 = 10;
 
+    /// Highest protocol version understood (RFC 8210).
+    pub const MAX_VERSION: u8 = 1;
     /// Length of the common PDU header (RFC 8210 section 5.1).
     const HEADER_LENGTH: usize = 8;
     /// Upper bound for variable-length PDUs (Router Key, Error Report), so a
@@ -80,7 +175,12 @@ impl Message {
 
     /// Checks the length field of a PDU header against its type
     /// (RFC 8210 section 5). Unknown types are an error.
-    fn check_length(version: u8, message_type: u8, length: usize) -> Result<(), Error> {
+    fn check_length(
+        header: &[u8],
+        version: u8,
+        message_type: u8,
+        length: usize,
+    ) -> Result<(), RtrError> {
         let ok = match message_type {
             Message::SERIAL_NOTIFY | Message::SERIAL_QUERY => length == 12,
             Message::RESET_QUERY | Message::CACHE_RESPONSE | Message::CACHE_RESET => length == 8,
@@ -92,20 +192,39 @@ impl Message {
             // Header + encapsulated PDU length (4) + error text length (4).
             Message::ERROR_REPORT => (16..=Message::MAX_LENGTH).contains(&length),
             _ => {
-                return Err(Error::ParseError(format!(
-                    "unknown RPKI message type: {}",
-                    message_type
-                )));
+                return Err(RtrError::new(
+                    error_code::UNSUPPORTED_PDU_TYPE,
+                    header,
+                    format!("unsupported PDU type {}", message_type),
+                ));
             }
         };
         if ok {
             Ok(())
         } else {
-            Err(Error::ParseError(format!(
-                "invalid RPKI message length {} for type {}",
-                length, message_type
-            )))
+            Err(RtrError::new(
+                error_code::CORRUPT_DATA,
+                header,
+                format!("invalid length {} for PDU type {}", length, message_type),
+            ))
         }
+    }
+
+    /// Checks the prefix and maximum length of an IP Prefix PDU
+    /// (RFC 8210 sections 5.6, 5.7): the prefix length must not exceed the
+    /// address width and the maximum length must lie between the two.
+    fn check_prefix(pdu: &[u8], width: u8, prefix_len: u8, max_length: u8) -> Result<(), RtrError> {
+        if prefix_len > width || max_length > width || max_length < prefix_len {
+            return Err(RtrError::new(
+                error_code::CORRUPT_DATA,
+                pdu,
+                format!(
+                    "invalid prefix length {} / max length {}",
+                    prefix_len, max_length
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn to_bytes(&self, version: u8) -> Result<Vec<u8>, Error> {
@@ -201,14 +320,23 @@ impl Message {
                 c.write_u16::<NetworkEndian>(0)?;
                 c.write_u32::<NetworkEndian>(8)?;
             }
-            Message::ErrorReport { error_code } => {
+            Message::ErrorReport {
+                error_code,
+                pdu,
+                text,
+            } => {
+                // Keep the whole PDU within the decoder's limit.
+                let room = Message::MAX_LENGTH - 16;
+                let pdu = &pdu[..pdu.len().min(room)];
+                let text = &text.as_bytes()[..text.len().min(room - pdu.len())];
                 c.write_u8(version)?;
                 c.write_u8(Message::ERROR_REPORT)?;
                 c.write_u16::<NetworkEndian>(*error_code)?;
-                c.write_u32::<NetworkEndian>(16)?;
-                // No encapsulated PDU and no error text.
-                c.write_u32::<NetworkEndian>(0)?;
-                c.write_u32::<NetworkEndian>(0)?;
+                c.write_u32::<NetworkEndian>((16 + pdu.len() + text.len()) as u32)?;
+                c.write_u32::<NetworkEndian>(pdu.len() as u32)?;
+                std::io::Write::write_all(&mut c, pdu)?;
+                c.write_u32::<NetworkEndian>(text.len() as u32)?;
+                std::io::Write::write_all(&mut c, text)?;
             }
         }
         Ok(c.into_inner())
@@ -216,10 +344,11 @@ impl Message {
 
     /// Parses one PDU from `buf`. Returns `Ok(None)` if `buf` does not yet
     /// hold the whole PDU, and an error if the PDU is malformed or of an
-    /// unsupported type. The returned length is the number of bytes to
-    /// consume; the message is `None` for PDUs that are skipped.
+    /// unsupported type or version. The returned length is the number of
+    /// bytes to consume and the version is that of the PDU; the message is
+    /// `None` for PDUs that are skipped.
     #[allow(clippy::type_complexity)]
-    fn from_bytes(buf: &[u8]) -> Result<Option<(Option<Message>, usize)>, Error> {
+    fn from_bytes(buf: &[u8]) -> Result<Option<(Option<Message>, u8, usize)>, RtrError> {
         if buf.len() < Message::HEADER_LENGTH {
             return Ok(None);
         }
@@ -231,10 +360,19 @@ impl Message {
         let session_id = c.read_u16::<NetworkEndian>()?;
         let length = c.read_u32::<NetworkEndian>()? as usize;
 
-        Message::check_length(version, message_type, length)?;
+        let header = &buf[..Message::HEADER_LENGTH];
+        if version > Message::MAX_VERSION {
+            return Err(RtrError::new(
+                error_code::UNSUPPORTED_PROTOCOL_VERSION,
+                header,
+                format!("unsupported protocol version {}", version),
+            ));
+        }
+        Message::check_length(header, version, message_type, length)?;
         if length > buf.len() {
             return Ok(None);
         }
+        let pdu = &buf[..length];
 
         let msg = match message_type {
             Message::SERIAL_NOTIFY => {
@@ -263,6 +401,7 @@ impl Message {
                     octets[i as usize] = c.read_u8()?;
                 }
                 let as_number = c.read_u32::<NetworkEndian>()?;
+                Message::check_prefix(pdu, (octets.len() * 8) as u8, prefix_len, max_length)?;
                 Message::IpPrefix(Prefix {
                     net: IpNet::new(IpAddr::from(octets), prefix_len),
                     flags,
@@ -280,6 +419,7 @@ impl Message {
                     octets[i as usize] = c.read_u8()?;
                 }
                 let as_number = c.read_u32::<NetworkEndian>()?;
+                Message::check_prefix(pdu, (octets.len() * 8) as u8, prefix_len, max_length)?;
                 Message::IpPrefix(Prefix {
                     net: IpNet::new(IpAddr::from(octets), prefix_len),
                     flags,
@@ -310,25 +450,49 @@ impl Message {
             Message::CACHE_RESET => Message::CacheReset,
             // For ErrorReport, bytes 2-3 of the common header carry the error code
             // rather than a session ID (RFC 8210 section 10).
-            Message::ERROR_REPORT => Message::ErrorReport {
-                error_code: session_id,
-            },
+            Message::ERROR_REPORT => {
+                let corrupt = || {
+                    RtrError::new(
+                        error_code::CORRUPT_DATA,
+                        pdu,
+                        "inconsistent Error Report lengths".to_string(),
+                    )
+                };
+                let body = &pdu[Message::HEADER_LENGTH..];
+                let pdu_len = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
+                let rest = body[4..].get(pdu_len..).ok_or_else(corrupt)?;
+                let enc = body[4..4 + pdu_len].to_vec();
+                let text_len =
+                    u32::from_be_bytes(rest.get(..4).ok_or_else(corrupt)?.try_into().unwrap())
+                        as usize;
+                if rest.len() != 4 + text_len {
+                    return Err(corrupt());
+                }
+                Message::ErrorReport {
+                    error_code: session_id,
+                    pdu: enc,
+                    text: String::from_utf8_lossy(&rest[4..]).into_owned(),
+                }
+            }
             // Router Key PDUs (BGPsec) are not used; skip them.
-            Message::ROUTER_KEY => return Ok(Some((None, length))),
+            Message::ROUTER_KEY => return Ok(Some((None, version, length))),
             _ => {
-                return Err(Error::ParseError(format!(
-                    "unknown RPKI message type: {}",
-                    message_type
-                )));
+                return Err(RtrError::new(
+                    error_code::UNSUPPORTED_PDU_TYPE,
+                    header,
+                    format!("unsupported PDU type {}", message_type),
+                ));
             }
         };
-        Ok(Some((Some(msg), length)))
+        Ok(Some((Some(msg), version, length)))
     }
 }
 
 pub struct RtrCodec {
     /// RTR protocol version used when encoding outgoing messages.
     version: u8,
+    /// Version of the most recently decoded PDU.
+    last_version: Option<u8>,
 }
 
 impl Default for RtrCodec {
@@ -340,12 +504,33 @@ impl Default for RtrCodec {
 impl RtrCodec {
     /// Creates a codec that encodes outgoing messages as RTR version 1 (RFC 8210).
     pub fn new() -> Self {
-        RtrCodec { version: 1 }
+        RtrCodec {
+            version: 1,
+            last_version: None,
+        }
     }
 
     /// Creates a codec that encodes outgoing messages using the given RTR version.
     pub fn with_version(version: u8) -> Self {
-        RtrCodec { version }
+        RtrCodec {
+            version,
+            last_version: None,
+        }
+    }
+
+    /// Version used when encoding outgoing messages.
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+
+    /// Changes the version used when encoding outgoing messages.
+    pub fn set_version(&mut self, version: u8) {
+        self.version = version;
+    }
+
+    /// Version of the most recently decoded PDU, if any.
+    pub fn last_version(&self) -> Option<u8> {
+        self.last_version
     }
 }
 
@@ -362,12 +547,13 @@ impl Encoder<&Message> for RtrCodec {
 
 impl Decoder for RtrCodec {
     type Item = Message;
-    type Error = Error;
+    type Error = RtrError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        while let Some((m, len)) = Message::from_bytes(src)? {
+        while let Some((m, version, len)) = Message::from_bytes(src)? {
             let _ = src.split_to(len);
             if m.is_some() {
+                self.last_version = Some(version);
                 return Ok(m);
             }
         }
@@ -553,12 +739,21 @@ mod tests {
         let mut buf = BytesMut::from(raw);
         let msg = decode(&mut buf);
         match msg {
-            Message::ErrorReport { error_code } => assert_eq!(error_code, 2),
+            Message::ErrorReport {
+                error_code,
+                pdu,
+                text,
+                ..
+            } => {
+                assert_eq!(error_code, 2);
+                assert!(pdu.is_empty());
+                assert!(text.is_empty());
+            }
             _ => panic!("unexpected message type"),
         }
     }
 
-    fn try_decode(raw: &[u8]) -> (Result<Option<Message>, Error>, usize) {
+    fn try_decode(raw: &[u8]) -> (Result<Option<Message>, RtrError>, usize) {
         let mut codec = RtrCodec::new();
         let mut buf = BytesMut::from(raw);
         let r = codec.decode(&mut buf);
@@ -567,13 +762,124 @@ mod tests {
 
     #[test]
     fn error_report_encode_roundtrip() {
-        let mut buf = encode(&Message::ErrorReport { error_code: 5 }, 1);
+        let msg = Message::ErrorReport {
+            error_code: 5,
+            pdu: vec![],
+            text: String::new(),
+        };
+        let mut buf = encode(&msg, 1);
         assert_eq!(buf.len(), 16);
         assert!(matches!(
             decode(&mut buf),
-            Message::ErrorReport { error_code: 5 }
+            Message::ErrorReport { error_code: 5, .. }
         ));
         assert!(buf.is_empty());
+
+        // With an encapsulated PDU and diagnostic text.
+        let enc = encode(&Message::CacheReset, 1).to_vec();
+        let msg = Message::ErrorReport {
+            error_code: error_code::CORRUPT_DATA,
+            pdu: enc.clone(),
+            text: "bad prefix".to_string(),
+        };
+        let mut buf = encode(&msg, 1);
+        assert_eq!(buf.len(), 16 + 8 + 10);
+        match decode(&mut buf) {
+            Message::ErrorReport {
+                error_code,
+                pdu,
+                text,
+            } => {
+                assert_eq!(error_code, error_code::CORRUPT_DATA);
+                assert_eq!(pdu, enc);
+                assert_eq!(text, "bad prefix");
+            }
+            _ => panic!("unexpected message type"),
+        }
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn error_report_inconsistent_lengths_rejected() {
+        // Encapsulated PDU length runs past the end of the PDU.
+        let mut raw = vec![1, Message::ERROR_REPORT, 0, 0, 0, 0, 0, 20];
+        raw.extend_from_slice(&100u32.to_be_bytes());
+        raw.extend_from_slice(&0u32.to_be_bytes());
+        raw.extend_from_slice(&[0; 4]);
+        let (r, _) = try_decode(&raw);
+        let e = r.err().unwrap();
+        assert_eq!(e.code, error_code::CORRUPT_DATA);
+        // Never answer an Error Report with an Error Report.
+        assert!(e.report().is_none());
+    }
+
+    fn prefix_pdu(v6: bool, prefix_len: u8, max_length: u8) -> Vec<u8> {
+        let (t, len, alen) = if v6 {
+            (Message::IPV6_PREFIX, 32u32, 16)
+        } else {
+            (Message::IPV4_PREFIX, 20u32, 4)
+        };
+        let mut raw = vec![1, t, 0, 0];
+        raw.extend_from_slice(&len.to_be_bytes());
+        raw.extend_from_slice(&[1, prefix_len, max_length, 0]);
+        raw.extend(std::iter::repeat_n(0, alen));
+        raw.extend_from_slice(&65001u32.to_be_bytes());
+        raw
+    }
+
+    #[test]
+    fn prefix_lengths_validated() {
+        for (v6, plen, maxlen, ok) in [
+            (false, 24, 24, true),
+            (false, 24, 32, true),
+            (false, 33, 33, false),
+            (false, 24, 33, false),
+            (false, 24, 16, false),
+            (true, 48, 128, true),
+            (true, 129, 129, false),
+            (true, 48, 129, false),
+            (true, 48, 32, false),
+        ] {
+            let raw = prefix_pdu(v6, plen, maxlen);
+            let (r, _) = try_decode(&raw);
+            if ok {
+                assert!(matches!(r, Ok(Some(Message::IpPrefix(_)))));
+            } else {
+                let e = r.err().unwrap();
+                assert_eq!(e.code, error_code::CORRUPT_DATA, "{} {}", plen, maxlen);
+                // The whole offending PDU is returned for the Error Report.
+                assert_eq!(e.pdu, raw);
+                assert!(matches!(
+                    e.report(),
+                    Some(Message::ErrorReport {
+                        error_code: error_code::CORRUPT_DATA,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_version_and_type_codes() {
+        let (r, _) = try_decode(&[2, Message::RESET_QUERY, 0, 0, 0, 0, 0, 8]);
+        assert_eq!(
+            r.err().unwrap().code,
+            error_code::UNSUPPORTED_PROTOCOL_VERSION
+        );
+        let (r, _) = try_decode(&[1, 200, 0, 0, 0, 0, 0, 8]);
+        assert_eq!(r.err().unwrap().code, error_code::UNSUPPORTED_PDU_TYPE);
+    }
+
+    #[test]
+    fn codec_records_pdu_version() {
+        let mut codec = RtrCodec::new();
+        assert_eq!(codec.last_version(), None);
+        let mut buf = encode(&Message::CacheReset, 0);
+        assert!(codec.decode(&mut buf).unwrap().is_some());
+        assert_eq!(codec.last_version(), Some(0));
+        codec.set_version(0);
+        assert_eq!(codec.version(), 0);
     }
 
     #[test]
