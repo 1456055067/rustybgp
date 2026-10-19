@@ -622,6 +622,10 @@ pub(crate) enum ToPeerEvent {
     /// Re-advertise all current best paths for the specified families.
     /// Used by RTC to export VPN routes after the EOR marker (or timer) arrives.
     RouteRefreshFamilies(Vec<Family>),
+    /// The RPKI validation state of this destination may have changed
+    /// (RFC 8481 section 4): re-run export if the peer's export policy
+    /// uses RPKI conditions.
+    RpkiRevalidate(Arc<table::NlriChange>),
 }
 
 pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) {
@@ -3441,6 +3445,16 @@ impl PeerSession {
             .collect()
     }
 
+    /// True if the export policy in effect for this peer has an RPKI
+    /// condition.
+    fn export_policy_needs_rpki(&self) -> bool {
+        self.state
+            .export_policy
+            .load_full()
+            .or_else(|| self.tables.export_policy.load_full())
+            .is_some_and(|p| p.needs_rpki)
+    }
+
     fn handle_prefix_update(&mut self, update: Arc<table::NlriChange>) {
         if !self.codec.has_family(update.family) {
             return;
@@ -3695,6 +3709,11 @@ impl PeerSession {
                         // helper mode) this is a safe no-op.
                         for family in self.pending.keys().cloned().collect::<Vec<_>>() {
                             self.do_route_refresh(family).await;
+                        }
+                    }
+                    Some(Some(ToPeerEvent::RpkiRevalidate(update))) => {
+                        if self.export_policy_needs_rpki() {
+                            self.handle_prefix_update(update);
                         }
                     }
                     Some(Some(ToPeerEvent::RouteRefreshFamilies(families))) => {
