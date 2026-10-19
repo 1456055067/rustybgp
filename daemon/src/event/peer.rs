@@ -458,6 +458,7 @@ impl PeerParams {
                 active_connect_join_handle: None,
                 gr_state: crate::gr::GrState::new(),
                 gr_restart_timer: None,
+                gr_timer_gen: 0,
                 llgr_family_timers: FnvHashMap::default(),
                 rtc_state: crate::rtc::RtcState::new(),
                 rtc_eor_timer: None,

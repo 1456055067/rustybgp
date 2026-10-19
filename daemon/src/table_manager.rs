@@ -555,6 +555,31 @@ impl TableManager {
                 t.end_deferral(family, kernel_handle.as_deref(), &subs);
             }
         }
+        // Every shard has queued its routes; peers that established during
+        // deferral can now send End-of-RIB for these families.
+        let txs = self.peer_event_senders();
+        for tx in txs {
+            let _ = tx.send(ToPeerEvent::DeferralComplete(families.to_vec()));
+        }
+    }
+
+    /// Event senders of all registered peers.  Every peer registers with
+    /// every shard, so shard 0's map is complete.
+    fn peer_event_senders(&self) -> Vec<mpsc::UnboundedSender<ToPeerEvent>> {
+        self.shards[0]
+            .lock()
+            .unwrap()
+            .peer_event_tx
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// True while best-path selection for `family` is deferred on any shard.
+    pub(crate) fn is_deferring(&self, family: Family) -> bool {
+        self.shards
+            .iter()
+            .any(|shard| shard.lock().unwrap().rtable.is_deferring(&family))
     }
 
     pub(crate) fn start_deferral_families(&self, families: &[Family]) {
@@ -1898,5 +1923,69 @@ mod tests {
             all_dest_ids.contains(&(1u32 << 24)),
             "shard 1 local_id=0 route must exist"
         );
+    }
+
+    #[test]
+    fn end_deferral_sends_routes_then_deferral_complete() {
+        // A peer that registered during deferral gets nothing from the initial
+        // dump; when deferral ends it receives the routes and only then the
+        // DeferralComplete marker that releases its End-of-RIB.
+        use std::net::IpAddr;
+
+        let tm = TableManager::new(2);
+        tm.start_deferral_families(&[Family::IPV4]);
+        let source = Arc::new(table::Source::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            65001,
+            65000,
+            Ipv4Addr::new(10, 0, 0, 1),
+            table::PeerRole::Ebgp,
+        ));
+        let attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0u32).unwrap(),
+        ]);
+        for i in 0..8u8 {
+            let nlri = packet::Nlri::V4(packet::bgp::Ipv4Net {
+                addr: Ipv4Addr::new(10, 0, i, 0),
+                mask: 24,
+            });
+            tm.insert_route(
+                source.clone(),
+                Family::IPV4,
+                packet::PathNlri::new(nlri),
+                Some(bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1))),
+                attr.clone(),
+                None,
+                0u32,
+            );
+        }
+        assert!(tm.is_deferring(Family::IPV4));
+
+        let peer: IpAddr = "10.0.0.2".parse().unwrap();
+        let mut dumped = 0;
+        let mut rx = tm.register_peer(peer, FnvHashSet::default(), |rtable| {
+            dumped += rtable.collect_loc_rib_paths_limited(&Family::IPV4, 1).len();
+        });
+        assert_eq!(dumped, 0, "deferred routes must not be in the initial dump");
+
+        tm.end_deferral_families(&[Family::IPV4]);
+        assert!(!tm.is_deferring(Family::IPV4));
+
+        let mut routes = 0;
+        loop {
+            match rx
+                .try_recv()
+                .expect("DeferralComplete must follow the routes")
+            {
+                ToPeerEvent::NlriChange(_) => routes += 1,
+                ToPeerEvent::DeferralComplete(families) => {
+                    assert_eq!(families, vec![Family::IPV4]);
+                    break;
+                }
+                _ => panic!("unexpected event"),
+            }
+        }
+        assert_eq!(routes, 8);
     }
 }

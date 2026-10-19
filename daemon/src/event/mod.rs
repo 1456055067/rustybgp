@@ -217,6 +217,10 @@ pub(super) enum CloseReason {
     /// Graceful Restart: the remote peer detects the silent close and enters
     /// helper mode).
     Silent,
+    /// The peer restarted and opened a new connection while this session was
+    /// still Established (RFC 4724 §4.2): close without a NOTIFICATION and
+    /// treat it like a TCP failure, so GR helper mode retains the routes.
+    PeerRestarted,
 }
 
 impl ConnArbiter {
@@ -292,9 +296,13 @@ struct PeerContext {
     active_connect_join_handle: Option<tokio::task::JoinHandle<()>>,
     /// GR helper state machine; persists across sessions.
     gr_state: crate::gr::GrState,
-    /// Command channel for the GR restart timer task.
+    /// Command channel for the GR timer task (restart timer while the peer is
+    /// down, EOR wait timer after it reconnected).
     /// Send `()` to fire the timer immediately (RunNow); drop the sender to cancel silently.
     gr_restart_timer: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Bumped each time the GR timer is armed, so a timer that already fired
+    /// but lost the race for this lock against a re-arm is ignored.
+    gr_timer_gen: u64,
     /// Per-family LLGR stale timers.  Dropping a sender cancels the timer silently;
     /// sending `()` fires it immediately (used on force-down while LLGR is running).
     llgr_family_timers: FnvHashMap<Family, tokio::sync::oneshot::Sender<()>>,
@@ -545,6 +553,13 @@ impl Peer {
             local_addr: IpAddr::V4(self.config.local_router_id),
             link_addr: None,
             confederation_id: global.confederation.as_ref().map_or(0, |c| c.id),
+            llgr_families: self
+                .state
+                .remote_cap
+                .load()
+                .as_deref()
+                .map(|caps| llgr_capable_families(caps))
+                .unwrap_or_default(),
         }
     }
 
@@ -622,6 +637,10 @@ pub(crate) enum ToPeerEvent {
     /// Re-advertise all current best paths for the specified families.
     /// Used by RTC to export VPN routes after the EOR marker (or timer) arrives.
     RouteRefreshFamilies(Vec<Family>),
+    /// Selection deferral ended for these families and their routes have been
+    /// distributed: send the End-of-RIB withheld from sessions that
+    /// established during deferral (RFC 4724 §4.2).
+    DeferralComplete(Vec<Family>),
 }
 
 pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) {
@@ -1711,21 +1730,13 @@ impl Global {
                         }
                     }
                     stream = bgp_listen_futures.fuse() => {
-                        if let Some(Some(Ok(stream))) = stream
-                            && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Passive).await
-                        {
-                            let arb = h.conn_arbiter.clone();
-                            let join_handle = tokio::spawn(h.run(global.clone(), active_tx.clone()));
-                            arb.lock().unwrap().passive_join_handle = Some(join_handle);
+                        if let Some(Some(Ok(stream))) = stream {
+                            accept_and_spawn(&global, &tables, stream, crate::fsm::Role::Passive, &active_tx).await;
                         }
                     }
                     stream = active_rx.recv().fuse() => {
-                        if let Some(stream) = stream
-                            && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Active).await
-                        {
-                            let arb = h.conn_arbiter.clone();
-                            let join_handle = tokio::spawn(h.run(global.clone(), active_tx.clone()));
-                            arb.lock().unwrap().active_join_handle = Some(join_handle);
+                        if let Some(stream) = stream {
+                            accept_and_spawn(&global, &tables, stream, crate::fsm::Role::Active, &active_tx).await;
                         }
                     }
                     _ = (&mut stop_rx).fuse() => { break }
@@ -1736,6 +1747,87 @@ impl Global {
             global.write().await.listen_sockets.clear();
         }
     }
+}
+
+/// How long a new connection from a restarted peer waits for the previous
+/// session to finish tearing down before it is accepted (or refused).
+const RESTART_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Accept `stream` and spawn its session task.
+///
+/// If the peer still has an Established session with GR negotiated, the new
+/// connection means the peer restarted (RFC 4724 §4.2): the old session is
+/// closed with its routes retained, and the new connection is accepted once
+/// the old session's task has finished, so the two never share the peer's
+/// RIB registration.
+async fn accept_and_spawn(
+    global: &GlobalHandle,
+    tables: &TableHandle,
+    stream: TcpStream,
+    role: crate::fsm::Role,
+    active_tx: &mpsc::UnboundedSender<TcpStream>,
+) {
+    let old_session = match stream.peer_addr() {
+        Ok(addr) => close_restarted_session(global, addr.ip()).await,
+        Err(_) => None,
+    };
+    let restarting = old_session.is_some();
+    let global = global.clone();
+    let tables = tables.clone();
+    let active_tx = active_tx.clone();
+    let accept = async move {
+        if let Some(old) = old_session
+            && tokio::time::timeout(RESTART_TEARDOWN_TIMEOUT, old)
+                .await
+                .is_err()
+        {
+            log::warn!("previous session didn't close in time; new connection may be refused");
+        }
+        if let Some(h) = accept_connection(&global, &tables, stream, role).await {
+            let arb = h.conn_arbiter.clone();
+            let join_handle = tokio::spawn(h.run(global.clone(), active_tx));
+            let mut arb = arb.lock().unwrap();
+            match role {
+                crate::fsm::Role::Active => arb.active_join_handle = Some(join_handle),
+                crate::fsm::Role::Passive => arb.passive_join_handle = Some(join_handle),
+            }
+        }
+    };
+    if restarting {
+        // Don't stall the event loop while the old session tears down.
+        tokio::spawn(accept);
+    } else {
+        accept.await;
+    }
+}
+
+/// If `remote_addr`'s previous session is still Established with GR
+/// negotiated, tell it the peer restarted and return its task handle.
+async fn close_restarted_session(
+    global: &GlobalHandle,
+    remote_addr: IpAddr,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let g = global.read().await;
+    let peer = g.peers.get(&remote_addr)?;
+    if peer.admin_down {
+        return None;
+    }
+    let remote_cap = peer.state.remote_cap.load_full()?;
+    let ctx = peer.context.lock().unwrap();
+    let mut arb = ctx.conn_arbiter.lock().unwrap();
+    let role = arb.fsm().gr_restart_role(&remote_cap)?;
+    // Without the task handle there is no way to wait for the teardown; leave
+    // the session alone and let the usual duplicate-connection check apply.
+    let arb = &mut *arb;
+    let (close_tx, join_handle) = match role {
+        crate::fsm::Role::Active => (&mut arb.active_close_tx, &mut arb.active_join_handle),
+        crate::fsm::Role::Passive => (&mut arb.passive_close_tx, &mut arb.passive_join_handle),
+    };
+    join_handle.as_ref()?;
+    let tx = close_tx.take()?;
+    log::info!("{remote_addr}: new connection while Established with GR; treating as restart");
+    let _ = tx.send(CloseReason::PeerRestarted);
+    join_handle.take()
 }
 
 async fn accept_connection(
@@ -2015,6 +2107,11 @@ struct NegotiatedGr {
     /// Both sides advertised the N-bit (RFC 8538): GR applies to NOTIFICATION
     /// and Hold Timer expiry in addition to unplanned TCP disconnects.
     notification_enabled: bool,
+    /// GR families whose Forwarding State (F) bit was clear in the peer's
+    /// OPEN: the peer kept no forwarding state for them, so retained stale
+    /// routes must be flushed at once instead of waiting for EOR
+    /// (RFC 4724 §4.2).
+    forwarding_lost: Vec<Family>,
 }
 
 /// Stored in DisconnectInfo so PeerSession::run can drive GrState on session drop.
@@ -2069,6 +2166,42 @@ fn gr_on_disconnect(
         _ => false,
     };
     if applies { Some(gr) } else { None }
+}
+
+/// Families for which the peer advertised the LLGR capability, i.e. that
+/// may receive LLGR_STALE routes (RFC 9494 §4.5).
+fn llgr_capable_families(remote_capabilities: &[packet::Capability]) -> FnvHashSet<Family> {
+    remote_capabilities
+        .iter()
+        .find_map(|c| match c {
+            packet::Capability::LongLivedGracefulRestart(v) => {
+                Some(v.iter().map(|(f, _, _)| *f).collect())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Filter the negotiated GR/LLGR state down to what survives this disconnect.
+///
+/// GR follows [`gr_on_disconnect`].  LLGR follows the same rules (RFC 9494
+/// §4.2): it applies when GR does, or on a plain TCP drop when GR wasn't
+/// negotiated.  Anything returned as `None` here means the peer's routes for
+/// those families must be flushed rather than retained as stale.
+fn gr_eligible_on_disconnect(
+    shutdown: &Option<crate::fsm::SessionDownReason>,
+    gr: Option<NegotiatedGr>,
+    llgr: Option<NegotiatedLlgr>,
+) -> (Option<NegotiatedGr>, Option<NegotiatedLlgr>) {
+    let gr = gr.and_then(|gr| gr_on_disconnect(shutdown, gr));
+    let llgr = llgr.filter(|_| {
+        gr.is_some()
+            || matches!(
+                shutdown,
+                None | Some(crate::fsm::SessionDownReason::IoError)
+            )
+    });
+    (gr, llgr)
 }
 
 /// Apply outputs from [`crate::gr::RestartingDeferral::process`].
@@ -2292,15 +2425,53 @@ fn spawn_llgr_timers(
         .collect()
 }
 
+/// How long the helper waits for End-of-RIB after a restarting peer
+/// reconnects before deleting the stale routes still pending (RFC 4724 §4.2
+/// lets the receiver bound this wait).  Matches FRR's stalepath-time default.
+const STALE_PATH_TIME: Duration = Duration::from_secs(360);
+
+/// Arm the GR timer: the restart timer after a session drop, or the EOR wait
+/// timer after a reconnect.  Replaces (and so cancels) any running one.
+fn arm_gr_timer(
+    ctx: &mut PeerContext,
+    context: &Arc<std::sync::Mutex<PeerContext>>,
+    tables: &TableHandle,
+    addr: IpAddr,
+    dur: Duration,
+) {
+    ctx.gr_timer_gen += 1;
+    let generation = ctx.gr_timer_gen;
+    let context_c = Arc::clone(context);
+    let tables_c = tables.clone();
+    let (timer_tx, timer_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let run = match tokio::time::timeout(dur, timer_rx).await {
+            Err(_) | Ok(Ok(())) => true,
+            Ok(Err(_)) => false,
+        };
+        if run {
+            gr_restart_timer_expired(context_c, tables_c, addr, generation).await;
+        }
+    });
+    ctx.gr_restart_timer = Some(timer_tx);
+}
+
 async fn gr_restart_timer_expired(
     context: Arc<std::sync::Mutex<PeerContext>>,
     tables: TableHandle,
     addr: IpAddr,
+    generation: u64,
 ) {
-    let (delete_families, llgr_start) = {
+    let (awaiting_eor, delete_families, delete_llgr_families, llgr_start) = {
         let mut ctx = context.lock().unwrap();
+        if ctx.gr_timer_gen != generation {
+            return;
+        }
+        ctx.gr_restart_timer = None;
+        let awaiting_eor = ctx.gr_state.is_awaiting_eor();
         let outputs = ctx.gr_state.process(crate::gr::GrInput::TimerExpired);
         let del = collect_delete_families(&outputs);
+        let del_llgr = collect_delete_llgr_families(&outputs);
         let llgr = outputs.into_iter().find_map(|o| {
             if let crate::gr::GrOutput::StartLlgrTimers(fs) = o {
                 Some(fs)
@@ -2308,8 +2479,19 @@ async fn gr_restart_timer_expired(
                 None
             }
         });
-        (del, llgr)
+        (awaiting_eor, del, del_llgr, llgr)
     };
+    if awaiting_eor {
+        // EOR wait timer: the peer is up again, so only the previous
+        // session's stale routes go; fresh ones stay.
+        if !delete_families.is_empty() {
+            tables.drop_stale_families(addr, &delete_families);
+        }
+        if !delete_llgr_families.is_empty() {
+            tables.drop_llgr_stale_families(addr, &delete_llgr_families);
+        }
+        return;
+    }
     if !delete_families.is_empty() {
         tables.drop_families(addr, &delete_families);
     }
@@ -2521,6 +2703,12 @@ struct PeerSession {
     keepalive_futures: FuturesUnordered<tokio::time::Sleep>,
     holdtime_futures: FuturesUnordered<tokio::time::Sleep>,
     pending: FnvHashMap<Family, crate::peer_tx::PendingTx>,
+    /// Families whose initial End-of-RIB is withheld until selection deferral
+    /// ends (local speaker restarting, RFC 4724 §4.2).
+    deferred_eor: FnvHashSet<Family>,
+    /// Families whose route refresh was requested during deferral; re-run on
+    /// `DeferralComplete`.
+    deferred_refresh: FnvHashSet<Family>,
     txbuf_size: usize,
 }
 
@@ -2549,6 +2737,7 @@ impl PeerSession {
             local_addr,
             link_addr,
             confederation_id: res.confederation_id,
+            llgr_families: FnvHashSet::default(),
         };
         let codec = export_ctx.build_codec();
 
@@ -2598,6 +2787,8 @@ impl PeerSession {
                 .into_iter()
                 .collect(),
             pending: FnvHashMap::default(),
+            deferred_eor: FnvHashSet::default(),
+            deferred_refresh: FnvHashSet::default(),
             txbuf_size,
         })
     }
@@ -2635,6 +2826,7 @@ impl PeerSession {
                 local_addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                 link_addr: None,
                 confederation_id: 0,
+                llgr_families: FnvHashSet::default(),
             },
             state: Arc::new(PeerState {
                 fsm: AtomicU8::new(0),
@@ -2676,6 +2868,8 @@ impl PeerSession {
                 .into_iter()
                 .collect(),
             pending: FnvHashMap::default(),
+            deferred_eor: FnvHashSet::default(),
+            deferred_refresh: FnvHashSet::default(),
             txbuf_size: 1 << 16,
         }
     }
@@ -2721,22 +2915,33 @@ impl PeerSession {
         // N-bit (0x4): both sides must advertise it for RFC 8538 behavior.
         let notification_enabled = (local_flags & 0x4 != 0) && (peer_flags & 0x4 != 0);
 
+        // Per-AFI Forwarding State bit (0x80).
+        let forwarding_lost: Vec<Family> = negotiated
+            .iter()
+            .filter(|f| {
+                peer_families
+                    .iter()
+                    .any(|(pf, flags)| pf == *f && flags & 0x80 == 0)
+            })
+            .copied()
+            .collect();
+
         Some(NegotiatedGr {
             families: negotiated,
             restart_time: std::time::Duration::from_secs(peer_restart_time as u64),
             notification_enabled,
+            forwarding_lost,
         })
     }
 
     /// Negotiate LLGR (RFC 9494) using local and remote LongLivedGracefulRestart capabilities.
     ///
     /// Returns Some when both sides advertise the capability with at least one family in common
-    /// and the negotiated stale time is non-zero.
+    /// for which the peer's stale time is non-zero.
     ///
-    /// Per RFC 9494 s3, the stale time comes from the peer's capability (how long they want us
-    /// to preserve their stale routes).  When the peer sends 0 for a family, LLGR MUST NOT be
-    /// activated for that family; we fall back to our locally configured time so that a peer
-    /// that omits the field (effectively sending 0) does not silently disable LLGR helper mode.
+    /// Per RFC 9494 §3, the stale time comes from the peer's capability (how long they want us
+    /// to preserve their stale routes).  A peer stale time of 0 means the peer doesn't want
+    /// LLGR for that family, so it is left out.
     fn negotiate_llgr(&self, remote_capabilities: &[packet::Capability]) -> Option<NegotiatedLlgr> {
         let local_families: Vec<(Family, u32)> = self.local_cap.iter().find_map(|c| match c {
             packet::Capability::LongLivedGracefulRestart(v) => {
@@ -2753,17 +2958,12 @@ impl PeerSession {
 
         let families: Vec<(Family, std::time::Duration)> = local_families
             .iter()
-            .filter_map(|(local_f, local_time)| {
+            .filter_map(|(local_f, _)| {
                 let (f, _, peer_time) = peer_families.iter().find(|(pf, _, _)| pf == local_f)?;
-                let stale_secs = if *peer_time > 0 {
-                    *peer_time
-                } else {
-                    *local_time
-                };
-                if stale_secs == 0 {
+                if *peer_time == 0 {
                     return None;
                 }
-                Some((*f, std::time::Duration::from_secs(stale_secs as u64)))
+                Some((*f, std::time::Duration::from_secs(*peer_time as u64)))
             })
             .collect();
 
@@ -2851,12 +3051,19 @@ impl PeerSession {
         } else {
             None
         };
+        // Families still under selection deferral (we are the restarting
+        // speaker): the shard exports nothing for them, and their End-of-RIB
+        // waits for DeferralComplete.
+        let mut deferred: FnvHashSet<Family> = FnvHashSet::default();
         let peer_event_rx = self
             .tables
             .register_peer(self.remote_addr, addpath, |rtable| {
                 for f in &families {
                     if rtc_awaiting_eor && crate::rtc::is_vpn_family(*f) {
                         continue;
+                    }
+                    if rtable.is_deferring(f) {
+                        deferred.insert(*f);
                     }
                     let effective_max = family_effective_max.get(f).copied().unwrap_or(1);
                     let addpath_tx = self.pending.get(f).map(|p| p.addpath_tx()).unwrap_or(false);
@@ -2895,11 +3102,15 @@ impl PeerSession {
             if rtc_awaiting_eor && crate::rtc::is_vpn_family(*f) {
                 continue;
             }
+            if deferred.contains(f) {
+                continue;
+            }
             self.pending
                 .get_mut(f)
                 .unwrap()
                 .buffer_messages(vec![bgp::Message::eor(*f)]);
         }
+        self.deferred_eor = deferred;
         let remote_holdtime = HoldTime::new(self.state.remote_holdtime.load(Ordering::Relaxed))
             .unwrap_or(HoldTime::DISABLED);
         self.tables.peer_up(PeerUpData {
@@ -2927,8 +3138,27 @@ impl PeerSession {
         });
     }
 
+    /// Selection deferral ended for `families`; their routes already arrived
+    /// as NlriChange events.  Send the withheld End-of-RIB, or redo a route
+    /// refresh that was requested meanwhile (it sends its own EOR).
+    async fn on_deferral_complete(&mut self, families: Vec<Family>) {
+        for family in families {
+            let eor = self.deferred_eor.remove(&family);
+            if self.deferred_refresh.remove(&family) {
+                self.do_route_refresh(family).await;
+            } else if eor && let Some(pending) = self.pending.get_mut(&family) {
+                pending.schedule_eor();
+            }
+        }
+    }
+
     async fn do_route_refresh(&mut self, family: Family) {
         if !self.pending.contains_key(&family) {
+            return;
+        }
+        if self.tables.is_deferring(family) {
+            // Nothing is exported until deferral ends; redo it then.
+            self.deferred_refresh.insert(family);
             return;
         }
         // For VPN families in Active state, build the RT filter from current adj-in RTC paths.
@@ -3039,6 +3269,7 @@ impl PeerSession {
                     // is consumed by Arc::new below.
                     self.negotiated_gr = self.negotiate_gr(&remote_capabilities);
                     self.negotiated_llgr = self.negotiate_llgr(&remote_capabilities);
+                    self.export_ctx.llgr_families = llgr_capable_families(&remote_capabilities);
                     effects.push(GlobalEffect::GrSessionEstablished {
                         negotiated_gr: self.negotiated_gr.clone(),
                     });
@@ -3119,6 +3350,18 @@ impl PeerSession {
                         .as_ref()
                         .map(|g| g.families.clone())
                         .unwrap_or_default();
+                    // Helper side: only families whose F bit is set keep their
+                    // stale routes until EOR (RFC 4724 §4.2).
+                    let forwarding_families: Vec<Family> = negotiated_gr
+                        .as_ref()
+                        .map(|g| {
+                            g.families
+                                .iter()
+                                .filter(|f| !g.forwarding_lost.contains(f))
+                                .copied()
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
                     // Cancel any previous restart timer (no ctx lock held across await).
                     {
@@ -3155,26 +3398,38 @@ impl PeerSession {
                             global.write().await.selection_deferral_timer = Some(handle);
                         }
                     } else {
-                        // Helper side: advance GrState (no deferral timer — restart timer
-                        // started at session drop covers the full stale-route window).
-                        let (delete_families, delete_llgr_families, stop_llgr) = {
+                        // Helper side: advance GrState.  While stale routes wait for
+                        // EOR the GR timer is re-armed as the EOR wait timer.
+                        let (delete_families, delete_llgr_families) = {
                             let mut ctx = self.context.lock().unwrap();
-                            let outputs = ctx
-                                .gr_state
-                                .process(crate::gr::GrInput::SessionEstablished { gr_families });
-                            let stop = outputs
-                                .iter()
-                                .any(|o| matches!(o, crate::gr::GrOutput::StopLlgrTimers));
-                            if stop {
-                                ctx.cancel_llgr_timers();
+                            let outputs =
+                                ctx.gr_state
+                                    .process(crate::gr::GrInput::SessionEstablished {
+                                        gr_families: forwarding_families,
+                                        eor_timeout: STALE_PATH_TIME,
+                                    });
+                            for output in &outputs {
+                                match output {
+                                    crate::gr::GrOutput::StopLlgrTimers => {
+                                        ctx.cancel_llgr_timers();
+                                    }
+                                    crate::gr::GrOutput::StartTimer(dur) => {
+                                        arm_gr_timer(
+                                            &mut ctx,
+                                            &self.context,
+                                            &self.tables,
+                                            self.remote_addr,
+                                            *dur,
+                                        );
+                                    }
+                                    _ => {}
+                                }
                             }
                             (
                                 collect_delete_families(&outputs),
                                 collect_delete_llgr_families(&outputs),
-                                stop,
                             )
                         };
-                        let _ = stop_llgr; // consumed via cancel_llgr_timers above
                         if !delete_families.is_empty() {
                             self.tables
                                 .drop_stale_families(self.remote_addr, &delete_families);
@@ -3207,6 +3462,12 @@ impl PeerSession {
                         let outputs = ctx
                             .gr_state
                             .process(crate::gr::GrInput::EorReceived(family));
+                        if outputs
+                            .iter()
+                            .any(|o| matches!(o, crate::gr::GrOutput::StopTimer))
+                        {
+                            ctx.cancel_gr_timer();
+                        }
                         (
                             collect_delete_families(&outputs),
                             collect_delete_llgr_families(&outputs),
@@ -3657,6 +3918,10 @@ impl PeerSession {
                         // peer treats this as a GR restart event.
                         return Step::Terminate { reason: crate::fsm::SessionDownReason::AdminShutdown, notification: None };
                     }
+                    Some(Ok(CloseReason::PeerRestarted)) => {
+                        log::info!("{}: peer restarted, closing previous session", self.remote_addr);
+                        return Step::Terminate { reason: crate::fsm::SessionDownReason::IoError, notification: None };
+                    }
                     _ => {}
                 }
             }
@@ -3701,6 +3966,9 @@ impl PeerSession {
                         for family in families {
                             self.do_route_refresh(family).await;
                         }
+                    }
+                    Some(Some(ToPeerEvent::DeferralComplete(families))) => {
+                        self.on_deferral_complete(families).await;
                     }
                     Some(None) => {
                         self.peer_event_rx = None;
@@ -3868,17 +4136,29 @@ impl PeerSession {
 
         let shutdown_reason = Some(reason);
 
+        // Decide GR/LLGR eligibility before touching the RIB: a disconnect that
+        // doesn't qualify (e.g. Cease without the N-bit, Hard Reset, a local
+        // UPDATE error) must flush the peer's routes, not mark them stale.
+        let (negotiated_gr, negotiated_llgr) = gr_eligible_on_disconnect(
+            &shutdown_reason,
+            self.negotiated_gr.take(),
+            self.negotiated_llgr.take(),
+        );
+
         if !self.source.is_empty() {
             let drop_families = families_to_drop_on_disconnect(
                 self.source.keys(),
-                self.negotiated_gr.as_ref(),
-                self.negotiated_llgr.as_ref(),
+                negotiated_gr.as_ref(),
+                negotiated_llgr.as_ref(),
             );
+            // Every retained family is marked stale, LLGR-only ones included,
+            // so EOR or a reconnect can tell the old routes from fresh ones.
             let stale_families: Vec<Family> = self
-                .negotiated_gr
-                .as_ref()
-                .map(|g| g.families.clone())
-                .unwrap_or_default();
+                .source
+                .keys()
+                .filter(|f| !drop_families.contains(f))
+                .copied()
+                .collect();
             // All per-family Sources share the same peer-level fields; use any for BMP.
             let any_source = self.source.values().next().unwrap().clone();
             let bmp_reason = crate::bmp::session_down_to_bmp(shutdown_reason.clone());
@@ -3894,20 +4174,8 @@ impl PeerSession {
             });
         }
         disconnect.export_map = std::mem::take(&mut self.export_map);
-
-        disconnect.negotiated_gr = self
-            .negotiated_gr
-            .take()
-            .and_then(|gr| gr_on_disconnect(&shutdown_reason, gr));
-        // LLGR follows the same eligibility rules as GR (RFC 9494 §4.2).
-        if disconnect.negotiated_gr.is_some()
-            || matches!(
-                shutdown_reason,
-                None | Some(crate::fsm::SessionDownReason::IoError)
-            )
-        {
-            disconnect.negotiated_llgr = self.negotiated_llgr.take();
-        }
+        disconnect.negotiated_gr = negotiated_gr;
+        disconnect.negotiated_llgr = negotiated_llgr;
         disconnect
     }
 
@@ -4039,20 +4307,7 @@ async fn apply_disconnect(
         for output in &outputs {
             match output {
                 crate::gr::GrOutput::StartTimer(duration) => {
-                    let dur = *duration;
-                    let context_c = Arc::clone(context);
-                    let tables_c = tables.clone();
-                    let (timer_tx, timer_rx) = tokio::sync::oneshot::channel::<()>();
-                    tokio::spawn(async move {
-                        let run = match tokio::time::timeout(dur, timer_rx).await {
-                            Err(_) | Ok(Ok(())) => true,
-                            Ok(Err(_)) => false,
-                        };
-                        if run {
-                            gr_restart_timer_expired(context_c, tables_c, remote_addr).await;
-                        }
-                    });
-                    ctx.gr_restart_timer = Some(timer_tx);
+                    arm_gr_timer(&mut ctx, context, tables, remote_addr, *duration);
                 }
                 crate::gr::GrOutput::StartLlgrTimers(families) => {
                     // mark_llgr_stale only acquires shard locks (not PeerContext), safe here.
@@ -4068,8 +4323,12 @@ async fn apply_disconnect(
         // from the RIB in session_loop().  The next session must also send a
         // full update, so the export_map is discarded here and the next
         // session starts with an empty one.  Clean up any leftover GR state
-        // from a previous cycle that never recovered.
+        // from a previous cycle that never recovered: every route from the
+        // peer is gone, so nothing is left for a restart/LLGR timer or a
+        // pending EOR to clean up.
         ctx.cancel_gr_timer();
+        ctx.cancel_llgr_timers();
+        ctx.gr_state = crate::gr::GrState::new();
         // RTC: complete drop -- reset state to Inactive and cancel timer.
         ctx.rtc_state.process(crate::rtc::RtcInput::SessionDropped);
         ctx.cancel_rtc_timer();
@@ -7127,6 +7386,7 @@ local-address = "{local}"
             active_connect_join_handle: None,
             gr_state: crate::gr::GrState::new(),
             gr_restart_timer: None,
+            gr_timer_gen: 0,
             llgr_family_timers: FnvHashMap::default(),
             rtc_state: crate::rtc::RtcState::new(),
             rtc_eor_timer: None,
@@ -7180,6 +7440,7 @@ local-address = "{local}"
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
             notification_enabled: false,
+            forwarding_lost: vec![],
         });
 
         let mut session = PeerSession::new_for_test(remote_addr, context.clone(), tables);
@@ -7193,6 +7454,116 @@ local-address = "{local}"
         let ctx = context.lock().unwrap();
         // GrState should now be in PeerReconnected (helper side, waiting for EOR).
         assert!(ctx.gr_state.is_peer_restarting());
+    }
+
+    #[tokio::test]
+    async fn process_effects_gr_session_established_without_f_bit_skips_eor_wait() {
+        // The peer came back with GR for IPv4 but the F bit clear: it kept no
+        // forwarding state, so the stale routes go now instead of at EOR.
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let context = make_context();
+        {
+            let mut ctx = context.lock().unwrap();
+            ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
+                gr: Some(crate::gr::GrParams {
+                    families: vec![Family::IPV4],
+                    restart_time: Duration::from_secs(90),
+                }),
+                llgr: None,
+            });
+        }
+        let negotiated_gr = Some(NegotiatedGr {
+            families: vec![Family::IPV4],
+            restart_time: Duration::from_secs(90),
+            notification_enabled: false,
+            forwarding_lost: vec![Family::IPV4],
+        });
+
+        let mut session = PeerSession::new_for_test(remote_addr, context.clone(), tables);
+        session
+            .process_effects(
+                vec![GlobalEffect::GrSessionEstablished { negotiated_gr }],
+                &global,
+            )
+            .await;
+
+        let ctx = context.lock().unwrap();
+        assert!(!ctx.gr_state.is_peer_restarting());
+        assert!(ctx.gr_restart_timer.is_none());
+    }
+
+    #[tokio::test]
+    async fn process_effects_gr_session_established_arms_eor_wait_timer() {
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let context = make_context();
+        {
+            let mut ctx = context.lock().unwrap();
+            ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
+                gr: Some(crate::gr::GrParams {
+                    families: vec![Family::IPV4],
+                    restart_time: Duration::from_secs(90),
+                }),
+                llgr: None,
+            });
+        }
+        let negotiated_gr = Some(NegotiatedGr {
+            families: vec![Family::IPV4],
+            restart_time: Duration::from_secs(90),
+            notification_enabled: false,
+            forwarding_lost: vec![],
+        });
+
+        let mut session = PeerSession::new_for_test(remote_addr, context.clone(), tables);
+        session
+            .process_effects(
+                vec![GlobalEffect::GrSessionEstablished { negotiated_gr }],
+                &global,
+            )
+            .await;
+
+        let ctx = context.lock().unwrap();
+        assert!(ctx.gr_state.is_awaiting_eor());
+        assert!(ctx.gr_restart_timer.is_some());
+    }
+
+    #[tokio::test]
+    async fn deferral_complete_releases_withheld_eor() {
+        let tables = make_tables();
+        let context = make_context();
+        let mut session = PeerSession::new_for_test("10.0.0.1".parse().unwrap(), context, tables);
+        session
+            .pending
+            .insert(Family::IPV4, crate::peer_tx::PendingTx::new(false));
+        session
+            .pending
+            .insert(Family::IPV6, crate::peer_tx::PendingTx::new(false));
+        session.deferred_eor.insert(Family::IPV4);
+
+        // IPv6 wasn't deferred for this session: no second EOR for it.
+        session
+            .on_deferral_complete(vec![Family::IPV4, Family::IPV6])
+            .await;
+
+        let v4 = session
+            .pending
+            .get_mut(&Family::IPV4)
+            .unwrap()
+            .drain_messages(Family::IPV4);
+        assert!(matches!(
+            v4.as_slice(),
+            [bgp::Message::Update(bgp::Update::EndOfRib(Family::IPV4))]
+        ));
+        let v6 = session
+            .pending
+            .get_mut(&Family::IPV6)
+            .unwrap()
+            .drain_messages(Family::IPV6);
+        assert!(v6.is_empty());
+        assert!(session.deferred_eor.is_empty());
     }
 
     // ---- process_effects: GrEorReceived (helper side) ----
@@ -7217,6 +7588,7 @@ local-address = "{local}"
             ctx.gr_state
                 .process(crate::gr::GrInput::SessionEstablished {
                     gr_families: vec![Family::IPV4],
+                    eor_timeout: STALE_PATH_TIME,
                 });
         }
 
@@ -7253,6 +7625,7 @@ local-address = "{local}"
             families: vec![Family::IPV4, Family::IPV6],
             restart_time: Duration::from_secs(90),
             notification_enabled: false,
+            forwarding_lost: vec![],
         };
         let result = families_to_drop_on_disconnect(families.iter(), Some(&negotiated_gr), None);
         assert!(result.is_empty());
@@ -7265,6 +7638,7 @@ local-address = "{local}"
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
             notification_enabled: false,
+            forwarding_lost: vec![],
         };
         let result = families_to_drop_on_disconnect(families.iter(), Some(&negotiated_gr), None);
         assert_eq!(result, vec![Family::IPV6]);
@@ -7330,6 +7704,7 @@ local-address = "{local}"
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
             notification_enabled: false,
+            forwarding_lost: vec![],
         };
         let session_families = [Family::IPV4, Family::IPV6];
         let drop_families =
@@ -7435,12 +7810,162 @@ local-address = "{local}"
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
             notification_enabled: false,
+            forwarding_lost: vec![],
         };
         let llgr = NegotiatedLlgr {
             families: vec![(Family::IPV6, Duration::from_secs(600))],
         };
         let result = families_to_drop_on_disconnect(families.iter(), Some(&gr), Some(&llgr));
         assert!(result.is_empty());
+    }
+
+    fn gr_llgr_for_ipv4(notification_enabled: bool) -> (NegotiatedGr, NegotiatedLlgr) {
+        (
+            NegotiatedGr {
+                families: vec![Family::IPV4],
+                restart_time: Duration::from_secs(90),
+                notification_enabled,
+                forwarding_lost: vec![],
+            },
+            NegotiatedLlgr {
+                families: vec![(Family::IPV4, Duration::from_secs(600))],
+            },
+        )
+    }
+
+    #[test]
+    fn ineligible_disconnect_flushes_gr_families() {
+        // GR negotiated without the N-bit, session ended by a Cease: GR does not
+        // apply, so the family must be dropped instead of being marked stale.
+        let (gr, llgr) = gr_llgr_for_ipv4(false);
+        let cease = Some(crate::fsm::SessionDownReason::RemoteNotification(
+            bgp::Message::Notification(rustybgp_packet::Notification::CeaseAdminShutdown),
+        ));
+        let (gr, llgr) = gr_eligible_on_disconnect(&cease, Some(gr), Some(llgr));
+        assert!(gr.is_none());
+        assert!(llgr.is_none());
+        let families = [Family::IPV4];
+        assert_eq!(
+            families_to_drop_on_disconnect(families.iter(), gr.as_ref(), llgr.as_ref()),
+            vec![Family::IPV4]
+        );
+    }
+
+    #[test]
+    fn hard_reset_flushes_even_with_n_bit() {
+        let (gr, llgr) = gr_llgr_for_ipv4(true);
+        let hard_reset = Some(crate::fsm::SessionDownReason::RemoteNotification(
+            bgp::Message::Notification(rustybgp_packet::Notification::CeaseHardReset),
+        ));
+        let (gr, llgr) = gr_eligible_on_disconnect(&hard_reset, Some(gr), Some(llgr));
+        assert!(gr.is_none() && llgr.is_none());
+    }
+
+    #[test]
+    fn local_update_error_flushes() {
+        let (gr, llgr) = gr_llgr_for_ipv4(true);
+        let err = Some(crate::fsm::SessionDownReason::LocalNotification(
+            bgp::Message::Notification(rustybgp_packet::Notification::UpdateMalformedAttributeList),
+        ));
+        let (gr, llgr) = gr_eligible_on_disconnect(&err, Some(gr), Some(llgr));
+        assert!(gr.is_none() && llgr.is_none());
+    }
+
+    #[test]
+    fn tcp_drop_keeps_gr_and_llgr() {
+        let (gr, llgr) = gr_llgr_for_ipv4(false);
+        let (gr, llgr) = gr_eligible_on_disconnect(
+            &Some(crate::fsm::SessionDownReason::IoError),
+            Some(gr),
+            Some(llgr),
+        );
+        assert!(gr.is_some() && llgr.is_some());
+    }
+
+    /// Add a GR-enabled peer whose passive session is Established, with a
+    /// live close channel and task handle.  Returns the close receiver.
+    async fn established_gr_peer(
+        global: &GlobalHandle,
+        remote_addr: IpAddr,
+        peer_sends_gr: bool,
+    ) -> tokio::sync::oneshot::Receiver<CloseReason> {
+        let mut params = default_peer_params(remote_addr);
+        params.expected_remote_asn = 65002;
+        params.local_asn = 65001;
+        params.graceful_restart = Some(GrPeerConfig {
+            restart_time: 120,
+            notification_enabled: false,
+            families: vec![Family::IPV4],
+        });
+        let mut g = global.write().await;
+        g.add_peer(params, None).unwrap();
+        let peer = g.peers.get(&remote_addr).unwrap();
+        let mut caps = vec![
+            packet::Capability::MultiProtocol(Family::IPV4),
+            packet::Capability::FourOctetAsNumber(65002),
+        ];
+        if peer_sends_gr {
+            caps.push(packet::Capability::GracefulRestart {
+                flags: 0,
+                restart_time: 90,
+                families: vec![(Family::IPV4, 0x80)],
+            });
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let ctx = peer.context.lock().unwrap();
+            let mut arb = ctx.conn_arbiter.lock().unwrap();
+            let role = crate::fsm::Role::Passive;
+            arb.process(role, crate::fsm::Input::Connected(false));
+            arb.process(
+                role,
+                crate::fsm::Input::MessageReceived(bgp::Message::Open(bgp::Open {
+                    as_number: 65002,
+                    holdtime: HoldTime::new(90).unwrap(),
+                    router_id: u32::from(Ipv4Addr::new(2, 2, 2, 2)),
+                    capability: caps.clone(),
+                })),
+            );
+            arb.process(
+                role,
+                crate::fsm::Input::MessageReceived(bgp::Message::Keepalive),
+            );
+            assert_eq!(arb.state(role), crate::fsm::State::Established);
+            arb.passive_close_tx = Some(tx);
+            arb.passive_join_handle = Some(tokio::spawn(async {}));
+        }
+        peer.state.remote_cap.store(Some(Arc::new(caps)));
+        rx
+    }
+
+    #[tokio::test]
+    async fn new_connection_while_established_with_gr_closes_old_session() {
+        // RFC 4724 §4.2: the old session is closed as a restart, not refused.
+        let global = make_global();
+        let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
+        let mut close_rx = established_gr_peer(&global, remote_addr, true).await;
+
+        let old = close_restarted_session(&global, remote_addr).await;
+
+        assert!(old.is_some(), "old session's task handle must be returned");
+        assert!(matches!(
+            close_rx.try_recv(),
+            Ok(CloseReason::PeerRestarted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn new_connection_while_established_without_gr_leaves_old_session() {
+        let global = make_global();
+        let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
+        let mut close_rx = established_gr_peer(&global, remote_addr, false).await;
+
+        assert!(
+            close_restarted_session(&global, remote_addr)
+                .await
+                .is_none()
+        );
+        assert!(close_rx.try_recv().is_err());
     }
 
     // After a session ends via EOF the FSM Connection slot must be cleared
@@ -7503,6 +8028,7 @@ local-address = "{local}"
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
             notification_enabled: false,
+            forwarding_lost: vec![],
         });
         let mut session = PeerSession::new_for_test(remote_addr, context, tables);
         session
@@ -7536,6 +8062,7 @@ local-address = "{local}"
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
             notification_enabled: false,
+            forwarding_lost: vec![],
         });
         let mut session = PeerSession::new_for_test(remote_addr, context, tables);
 
@@ -7607,6 +8134,7 @@ local-address = "{local}"
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
             notification_enabled: false,
+            forwarding_lost: vec![],
         });
         let mut session = PeerSession::new_for_test(unknown_addr, context, tables);
         session
@@ -7663,6 +8191,26 @@ local-address = "{local}"
     async fn negotiate_gr_neither_n_bit_not_enabled() {
         let gr = make_gr_cap(0x0, 0x0).await.unwrap();
         assert!(!gr.notification_enabled);
+    }
+
+    #[tokio::test]
+    async fn negotiate_gr_records_families_without_forwarding_state() {
+        let tables = make_tables();
+        let context = make_context();
+        let mut session = PeerSession::new_for_test("10.0.0.1".parse().unwrap(), context, tables);
+        session.local_cap = vec![packet::Capability::GracefulRestart {
+            flags: 0,
+            restart_time: 120,
+            families: vec![(Family::IPV4, 0), (Family::IPV6, 0)],
+        }];
+        let remote_caps = vec![packet::Capability::GracefulRestart {
+            flags: 0,
+            restart_time: 90,
+            families: vec![(Family::IPV4, 0x80), (Family::IPV6, 0)],
+        }];
+        let gr = session.negotiate_gr(&remote_caps).unwrap();
+        assert_eq!(gr.families, vec![Family::IPV4, Family::IPV6]);
+        assert_eq!(gr.forwarding_lost, vec![Family::IPV6]);
     }
 
     // ---- negotiate_llgr ----
@@ -7729,20 +8277,32 @@ local-address = "{local}"
     }
 
     #[tokio::test]
-    async fn negotiate_llgr_falls_back_to_local_time_when_peer_sends_zero() {
-        // Peer sends stale-time=0 (some implementations omit the value or send 0).
-        // RFC 9494 says LLGR MUST NOT activate for that family, but we fall back to
-        // our locally configured time so that helper mode still engages.
+    async fn negotiate_llgr_none_when_peer_sends_zero() {
+        // RFC 9494: a peer stale time of 0 means no LLGR for that family, even
+        // though we have a local time configured.
         let session = make_session_with_llgr_cap(300); // local: 300s
         let remote_caps = vec![packet::Capability::LongLivedGracefulRestart(vec![(
             Family::IPV4,
             0,
             0, // peer sends 0
         )])];
+        assert!(session.negotiate_llgr(&remote_caps).is_none());
+    }
+
+    #[tokio::test]
+    async fn negotiate_llgr_uses_peer_time_when_local_is_zero() {
+        // Our own stale time only tells the peer how long to keep our routes.
+        let session = make_session_with_llgr_cap(0);
+        let remote_caps = vec![packet::Capability::LongLivedGracefulRestart(vec![(
+            Family::IPV4,
+            0,
+            300,
+        )])];
         let llgr = session.negotiate_llgr(&remote_caps).unwrap();
-        assert_eq!(llgr.families.len(), 1);
-        assert_eq!(llgr.families[0].0, Family::IPV4);
-        assert_eq!(llgr.families[0].1, Duration::from_secs(300)); // fallback to local
+        assert_eq!(
+            llgr.families,
+            vec![(Family::IPV4, Duration::from_secs(300))]
+        );
     }
 
     #[tokio::test]
@@ -7800,6 +8360,7 @@ local-address = "{local}"
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
             notification_enabled,
+            forwarding_lost: vec![],
         }
     }
 
@@ -7925,6 +8486,7 @@ local-address = "{local}"
                 local_addr: "127.0.0.1".parse().unwrap(),
                 link_addr: None,
                 confederation_id: 0,
+                llgr_families: FnvHashSet::default(),
             }
         }
 
@@ -8726,6 +9288,7 @@ local-address = "{local}"
                 local_addr: "127.0.0.1".parse().unwrap(),
                 link_addr: None,
                 confederation_id: 0,
+                llgr_families: FnvHashSet::default(),
             }
         }
 
@@ -9291,6 +9854,7 @@ local-address = "{local}"
                 local_addr: "127.0.0.1".parse().unwrap(),
                 link_addr: None,
                 confederation_id: 65000,
+                llgr_families: FnvHashSet::default(),
             }
         }
 
@@ -9301,6 +9865,7 @@ local-address = "{local}"
                 local_addr: "127.0.0.1".parse().unwrap(),
                 link_addr: None,
                 confederation_id: 65000,
+                llgr_families: FnvHashSet::default(),
             }
         }
 
@@ -9421,6 +9986,7 @@ local-address = "{local}"
                 local_addr: "127.0.0.1".parse().unwrap(),
                 link_addr: None,
                 confederation_id: 0,
+                llgr_families: FnvHashSet::default(),
             }
         }
 
@@ -9789,6 +10355,7 @@ local-address = "{local}"
                 local_addr: "127.0.0.1".parse().unwrap(),
                 link_addr: None,
                 confederation_id: 0,
+                llgr_families: FnvHashSet::default(),
             }
         }
 
@@ -9903,6 +10470,12 @@ local-address = "{local}"
                 })
         }
 
+        fn llgr_ctx() -> PeerExportContext {
+            let mut ctx = ebgp_ctx();
+            ctx.llgr_families.insert(Family::IPV4);
+            ctx
+        }
+
         #[test]
         fn llgr_stale_source_adds_llgr_stale_community() {
             const LLGR_STALE: u32 = 0xffff_0006;
@@ -9920,7 +10493,7 @@ local-address = "{local}"
                 SELF.parse().unwrap(),
                 &mut em,
                 &mut pending,
-                &ebgp_ctx(),
+                &llgr_ctx(),
                 None,
                 None,
                 None,
@@ -9963,6 +10536,126 @@ local-address = "{local}"
                 !has_community(&attrs, LLGR_STALE),
                 "LLGR_STALE community must not appear"
             );
+        }
+
+        #[test]
+        fn llgr_stale_route_withheld_from_non_llgr_peer() {
+            // RFC 9494 §4.5: the peer didn't send the LLGR capability, so the
+            // LLGR stale route is not advertised to it.
+            let mut em = ExportMap::default();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let src = source(PEER);
+            src.mark_llgr_stale();
+            let update = change(&net, true, false, None, vec![path(0, src)]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            assert!(!em.was_sent(Family::IPV4, 1));
+            assert!(pending.drain_messages(Family::IPV4).is_empty());
+        }
+
+        #[test]
+        fn route_becoming_llgr_stale_is_withdrawn_from_non_llgr_peer() {
+            let mut em = ExportMap::default();
+            em.mark_sent(Family::IPV4, 1, 0);
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let src = source(PEER);
+            src.mark_llgr_stale();
+            let update = change(&net, true, false, None, vec![path(0, src)]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            assert!(!em.was_sent(Family::IPV4, 1));
+            let msgs = pending.drain_messages(Family::IPV4);
+            assert!(reach_attrs(&msgs).is_none());
+            assert!(!msgs.is_empty(), "previously sent route must be withdrawn");
+        }
+
+        #[test]
+        fn relayed_llgr_stale_community_withheld_from_non_llgr_peer() {
+            // A route that already carries LLGR_STALE from another helper is
+            // LLGR stale too, even though our source for it is fresh.
+            let mut em = ExportMap::default();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let mut p = path(0, source(PEER));
+            p.attr = with_llgr_stale_community(&p.attr);
+            let update = change(&net, true, false, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            assert!(pending.drain_messages(Family::IPV4).is_empty());
+        }
+
+        #[test]
+        fn addpath_llgr_stale_path_withheld_from_non_llgr_peer() {
+            let mut em = ExportMap::new([Family::IPV4]);
+            let mut pending = crate::peer_tx::PendingTx::new(true);
+            let net = nlri("10.0.0.0/24");
+            let stale = source(PEER);
+            stale.mark_llgr_stale();
+            let update = change(
+                &net,
+                true,
+                true,
+                None,
+                vec![path(1, source("10.0.0.3")), path(2, stale)],
+            );
+
+            process_nlri_change(
+                &update,
+                2,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            assert!(em.contains_path(Family::IPV4, 1, 1));
+            assert!(!em.contains_path(Family::IPV4, 1, 2));
         }
 
         // ---- RFC 1997 well-known communities ----
@@ -11788,6 +12481,7 @@ local-address = "{local}"
             families: vec![Family::IPV4],
             restart_time: std::time::Duration::from_secs(90),
             notification_enabled: false,
+            forwarding_lost: vec![],
         }));
         apply_disconnect(&context, remote_addr, &tables, info).await;
     }
@@ -11799,6 +12493,34 @@ local-address = "{local}"
         let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
         let info = make_disconnect_info(None);
         apply_disconnect(&context, remote_addr, &tables, info).await;
+    }
+
+    #[tokio::test]
+    async fn non_gr_disconnect_resets_leftover_gr_state() {
+        // A previous GR cycle is still waiting for EOR when the new session
+        // drops without qualifying for GR: every route from the peer is
+        // flushed, so the helper must not keep waiting on the old cycle.
+        let tables = make_tables();
+        let context = make_context();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        {
+            let mut ctx = context.lock().unwrap();
+            ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
+                gr: Some(crate::gr::GrParams {
+                    families: vec![Family::IPV4],
+                    restart_time: Duration::from_secs(90),
+                }),
+                llgr: None,
+            });
+            ctx.gr_state
+                .process(crate::gr::GrInput::SessionEstablished {
+                    gr_families: vec![Family::IPV4],
+                    eor_timeout: STALE_PATH_TIME,
+                });
+            assert!(ctx.gr_state.is_peer_restarting());
+        }
+        apply_disconnect(&context, remote_addr, &tables, make_disconnect_info(None)).await;
+        assert!(!context.lock().unwrap().gr_state.is_peer_restarting());
     }
 
     // --- build_local_cap tests ---

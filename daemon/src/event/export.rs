@@ -242,9 +242,20 @@ pub(super) struct PeerExportContext {
     pub(super) link_addr: Option<Ipv6Addr>,
     /// Confederation Identifier (0 = not in a confederation).
     pub(super) confederation_id: u32,
+    /// Families for which the peer advertised the LLGR capability.  LLGR
+    /// stale routes are withheld from the other families (RFC 9494 §4.5).
+    pub(super) llgr_families: FnvHashSet<Family>,
 }
 
 impl PeerExportContext {
+    /// RFC 9494 §4.5: an LLGR stale route SHOULD NOT be advertised to a
+    /// neighbor that didn't send the LLGR capability (and must be withdrawn
+    /// from it).  Like GoBGP, the route is withheld rather than sent with
+    /// NO_EXPORT under the optional partial-deployment procedure.
+    pub(super) fn suppresses_llgr_stale(&self, family: Family, path: &table::Path) -> bool {
+        !self.llgr_families.contains(&family) && path.is_llgr_stale()
+    }
+
     /// Build a `PeerCodec` for wire encoding.
     ///
     /// The codec handles only wire framing; all attribute transformation and
@@ -640,6 +651,9 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             if well_known_community_suppress(&best.attr, export_ctx.role) {
                 return None;
             }
+            if export_ctx.suppresses_llgr_stale(update.family, best) {
+                return None;
+            }
             Some(best)
         });
         // BMP Adj-RIB-Out pre-policy: what would be exported before per-peer policy.
@@ -750,6 +764,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             .filter(|p| !ibgp_split_horizon_suppress(&p.source, export_ctx.role, cluster_id))
             .filter(|p| !rs_isolation_suppress(&p.source, export_ctx.role))
             .filter(|p| !well_known_community_suppress(&p.attr, export_ctx.role))
+            .filter(|p| !export_ctx.suppresses_llgr_stale(update.family, p))
             .take(effective_max)
             .filter_map(|path| {
                 if rtc_filter.is_some_and(|f| !f.allows(&path.attr)) {
