@@ -749,6 +749,25 @@ impl Nexthop {
         )
     }
 
+    /// Whether `len` is a valid MP_REACH_NLRI Next Hop length for
+    /// `family`. `extended_nexthop` is true when we advertised RFC 8950
+    /// for the family. Families not listed are checked by `from_bytes`.
+    fn len_is_valid(family: Family, len: u8, extended_nexthop: bool) -> bool {
+        match family {
+            // RFC 4760, RFC 8277; RFC 8950 §3 adds an IPv6 next hop.
+            Family::IPV4 | Family::IPV4_MC | Family::IPV4_MPLS => {
+                len == 4 || (extended_nexthop && (len == 16 || len == 32))
+            }
+            // RFC 4364 §4.3.2; RFC 8950 §3: RD + IPv6 address(es).
+            Family::IPV4_VPN => len == 12 || (extended_nexthop && (len == 24 || len == 48)),
+            // RFC 2545 §3, RFC 4798 §2.
+            Family::IPV6 | Family::IPV6_MC | Family::IPV6_MPLS => len == 16 || len == 32,
+            // RFC 4659 §3.2.1.
+            Family::IPV6_VPN => len == 24 || len == 48,
+            _ => true,
+        }
+    }
+
     /// Parse the Next Hop field of `family` (NEXT_HOP attribute value, or
     /// the MP_REACH_NLRI Next Hop field without the length octet).
     ///
@@ -795,9 +814,14 @@ impl Nexthop {
                 let ll: [u8; 16] = b[16..32].try_into().ok()?;
                 let ll_addr = Ipv6Addr::from(ll);
                 if ll_addr.is_unspecified() {
+                    // Some speakers send a zero second address; there is no
+                    // link-local next hop then.
                     Some(Nexthop::V6(Ipv6Addr::from(global)))
-                } else {
+                } else if ll_addr.is_unicast_link_local() {
                     Some(Nexthop::V6LinkLocal(Ipv6Addr::from(global), ll_addr))
+                } else {
+                    // RFC 2545 §3: the second address is link-local.
+                    None
                 }
             }
             _ => None,
@@ -1332,6 +1356,32 @@ impl Attribute {
         self.flags
     }
 
+    /// RFC 4271 Section 4.3: the Partial bit must be 0 for well-known and
+    /// optional non-transitive attributes.
+    fn partial_is_invalid(flags: u8) -> bool {
+        flags & Self::FLAG_PARTIAL != 0
+            && (flags & Self::FLAG_OPTIONAL == 0 || flags & Self::FLAG_TRANSITIVE == 0)
+    }
+
+    /// Whether this AS_PATH has an AS_CONFED_SEQUENCE or AS_CONFED_SET
+    /// segment.
+    fn as_path_has_confed(&self) -> bool {
+        let Some(buf) = self.binary() else {
+            return false;
+        };
+        let mut pos = 0;
+        while pos + 2 <= buf.len() {
+            if matches!(
+                buf[pos],
+                Self::AS_PATH_TYPE_CONFED_SEQ | Self::AS_PATH_TYPE_CONFED_SET
+            ) {
+                return true;
+            }
+            pos += 2 + buf[pos + 1] as usize * 4;
+        }
+        false
+    }
+
     /// Decode one complete BGP attribute, using four-octet AS numbers as in
     /// GoBGP's binary gRPC representation. Reject truncation and trailing data.
     pub fn decode_from_bytes(bytes: &[u8]) -> Result<Self, Notification> {
@@ -1352,11 +1402,7 @@ impl Attribute {
             None if flags & Self::FLAG_OPTIONAL == 0 => return Err(invalid()),
             _ => {}
         }
-        // RFC 4271 Section 4.3: the Partial bit must be 0 for well-known and
-        // optional non-transitive attributes.
-        if flags & Self::FLAG_PARTIAL != 0
-            && (flags & Self::FLAG_OPTIONAL == 0 || flags & Self::FLAG_TRANSITIVE == 0)
-        {
+        if Self::partial_is_invalid(flags) {
             return Err(invalid());
         }
         let len = if flags & Self::FLAG_EXTENDED != 0 {
@@ -1490,6 +1536,15 @@ impl Attribute {
                 }
                 AttributeData::Val(val)
             }
+            Self::NEXTHOP => {
+                // RFC 4271 §5.1.3, RFC 7606 §7.3: an IPv4 address.
+                if len != 4 {
+                    return Err(());
+                }
+                let mut b = vec![0u8; 4];
+                c.read_exact(&mut b).map_err(|_| ())?;
+                AttributeData::Bin(b)
+            }
             Self::MULTI_EXIT_DESC | Self::LOCAL_PREF | Self::ORIGINATOR_ID => {
                 if len != 4 {
                     return Err(());
@@ -1513,8 +1568,10 @@ impl Attribute {
                         }
                         let seg_type = b[pos];
                         let seg_count = b[pos + 1] as usize;
+                        // RFC 7606 §7.2: a zero Path Segment Length is malformed.
                         if !(Self::AS_PATH_TYPE_SET..=Self::AS_PATH_TYPE_CONFED_SET)
                             .contains(&seg_type)
+                            || seg_count == 0
                         {
                             return Err(());
                         }
@@ -1542,8 +1599,10 @@ impl Attribute {
                         }
                         let seg_type = b[pos];
                         let seg_count = b[pos + 1] as usize;
+                        // RFC 7606 §7.2: a zero Path Segment Length is malformed.
                         if !(Self::AS_PATH_TYPE_SET..=Self::AS_PATH_TYPE_CONFED_SET)
                             .contains(&seg_type)
+                            || seg_count == 0
                         {
                             return Err(());
                         }
@@ -1582,8 +1641,10 @@ impl Attribute {
                 }
             }
             Self::COMMUNITY => {
-                // RFC 1997 §4: each community value is 4 octets
-                if !len.is_multiple_of(4) {
+                // RFC 1997 §4: each community value is 4 octets. Here and
+                // below, RFC 7606 §7.8, §7.10, §7.14 and RFC 8092 §6 make an
+                // empty list malformed.
+                if len == 0 || !len.is_multiple_of(4) {
                     return Err(());
                 }
                 let mut b = vec![0u8; len as usize];
@@ -1592,7 +1653,7 @@ impl Attribute {
             }
             Self::EXTENDED_COMMUNITY => {
                 // RFC 4360 §4: each extended community value is 8 octets
-                if !len.is_multiple_of(8) {
+                if len == 0 || !len.is_multiple_of(8) {
                     return Err(());
                 }
                 let mut b = vec![0u8; len as usize];
@@ -1601,7 +1662,7 @@ impl Attribute {
             }
             Self::CLUSTER_LIST => {
                 // RFC 4456 §8: each cluster ID is 4 octets
-                if !len.is_multiple_of(4) {
+                if len == 0 || !len.is_multiple_of(4) {
                     return Err(());
                 }
                 let mut b = vec![0u8; len as usize];
@@ -1610,7 +1671,7 @@ impl Attribute {
             }
             Self::LARGE_COMMUNITY => {
                 // RFC 8092 §2: each large community value is 12 octets
-                if !len.is_multiple_of(12) {
+                if len == 0 || !len.is_multiple_of(12) {
                     return Err(());
                 }
                 let mut b = vec![0u8; len as usize];
@@ -1988,6 +2049,19 @@ impl Attribute {
     }
 
     pub(crate) fn encode_wire<B: BufMut + AsMut<[u8]>>(&self, dst: &mut B) -> u16 {
+        // An empty COMMUNITY, EXTENDED_COMMUNITY, LARGE_COMMUNITY or
+        // CLUSTER_LIST is malformed (RFC 7606 §7.8, §7.10, §7.14, RFC 8092
+        // §6) and makes the receiver withdraw the route; leave it out.
+        if matches!(
+            self.code,
+            Attribute::COMMUNITY
+                | Attribute::EXTENDED_COMMUNITY
+                | Attribute::LARGE_COMMUNITY
+                | Attribute::CLUSTER_LIST
+        ) && self.binary().is_some_and(|b| b.is_empty())
+        {
+            return 0;
+        }
         self.encode(dst).unwrap()
     }
 
@@ -2123,12 +2197,76 @@ pub struct ReachNlri {
 }
 
 /// One attribute that could not be parsed (RFC 7606).
-/// The caller uses `attr_flags` to determine the RFC 7606 action:
-/// optional + transitive -> discard; otherwise -> treat-as-withdraw.
+/// `AttributeError::action` gives the RFC 7606 approach for it.
 #[derive(Clone, Debug)]
 pub struct AttributeError {
     pub attr_code: u8,
     pub attr_flags: u8,
+}
+
+/// RFC 7606 §2 error-handling approaches that keep the session up,
+/// weakest first. A session reset is returned as a `Notification`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AttributeErrorAction {
+    AttributeDiscard,
+    TreatAsWithdraw,
+}
+
+impl AttributeError {
+    /// True when the received Optional or Transitive bit conflicts with
+    /// the attribute's definition, or the Partial bit is set where RFC 4271
+    /// §4.3 requires it to be 0.
+    fn flags_conflict(&self) -> bool {
+        Attribute::canonical_flags(self.attr_code).is_some_and(|expected| {
+            (self.attr_flags ^ expected) & (Attribute::FLAG_OPTIONAL | Attribute::FLAG_TRANSITIVE)
+                != 0
+                || Attribute::partial_is_invalid(self.attr_flags)
+        })
+    }
+
+    /// The RFC 7606 approach for this error. The approach is defined per
+    /// attribute (RFC 7606 §7), not derived from the received flags.
+    ///
+    /// `is_ebgp` is true for a non-confederation eBGP peer.
+    /// `has_legacy_nlri` is true when the UPDATE has a non-empty NLRI field.
+    pub fn action(&self, is_ebgp: bool, has_legacy_nlri: bool) -> AttributeErrorAction {
+        use AttributeErrorAction::*;
+        let optional = self.attr_flags & Attribute::FLAG_OPTIONAL != 0;
+        let transitive = self.attr_flags & Attribute::FLAG_TRANSITIVE != 0;
+        match self.attr_code {
+            // §7.5, §7.9, §7.10: discarded when received from an external
+            // neighbor, however they are malformed.
+            Attribute::LOCAL_PREF | Attribute::ORIGINATOR_ID | Attribute::CLUSTER_LIST
+                if is_ebgp =>
+            {
+                AttributeDiscard
+            }
+            // RFC 4760 §3: NEXT_HOP is ignored when there is no NLRI field.
+            Attribute::NEXTHOP if !has_legacy_nlri => AttributeDiscard,
+            // §3 (c): a flag conflict makes the attribute malformed and is
+            // handled by treat-as-withdraw.
+            _ if self.flags_conflict() => TreatAsWithdraw,
+            // §3 (f), §7.6, §7.7.
+            Attribute::ATOMIC_AGGREGATE | Attribute::AGGREGATOR => AttributeDiscard,
+            // RFC 6793 §6.
+            Attribute::AS4_PATH | Attribute::AS4_AGGREGATOR => AttributeDiscard,
+            // §3 (e), §7.1-§7.5, §7.8-§7.10, §7.14; RFC 8092 §6.
+            Attribute::ORIGIN
+            | Attribute::AS_PATH
+            | Attribute::NEXTHOP
+            | Attribute::MULTI_EXIT_DESC
+            | Attribute::LOCAL_PREF
+            | Attribute::COMMUNITY
+            | Attribute::ORIGINATOR_ID
+            | Attribute::CLUSTER_LIST
+            | Attribute::EXTENDED_COMMUNITY
+            | Attribute::LARGE_COMMUNITY => TreatAsWithdraw,
+            // No specific rule: an optional non-transitive attribute only
+            // affects this hop, so discard it; withdraw otherwise.
+            _ if optional && !transitive => AttributeDiscard,
+            _ => TreatAsWithdraw,
+        }
+    }
 }
 
 /// A parsed BGP UPDATE message (receive path).
@@ -2185,6 +2323,10 @@ pub enum ParsedMessage {
 /// eBGP peer.  When true, LOCAL_PREF, ORIGINATOR_ID, and CLUSTER_LIST are silently
 /// discarded per RFC 4271 §5.1.5 and RFC 4456 §8.
 ///
+/// `local_addr` is this speaker's address on the session. A route whose next
+/// hop is that address, or is not a valid unicast address, is treated as
+/// withdrawn (RFC 4271 §6.3).
+///
 /// Returns `Err(Notification)` when the session must send that `Notification`
 /// and close.  Returns `Ok(iter)` otherwise; the iterator yields the resulting
 /// `Message`s (normally 1, 2 for a multi-family UPDATE, 0 for discard-only
@@ -2192,10 +2334,11 @@ pub enum ParsedMessage {
 pub fn validate_message(
     msg: ParsedMessage,
     is_ebgp: bool,
+    local_addr: Option<IpAddr>,
 ) -> Result<impl Iterator<Item = Message>, Notification> {
     let msgs: Vec<Message> = match msg {
         ParsedMessage::Open(open) => vec![Message::Open(open)],
-        ParsedMessage::Update(update) => validate_update(update, is_ebgp)?,
+        ParsedMessage::Update(update) => validate_update(update, is_ebgp, local_addr)?,
         ParsedMessage::Notification(n) => vec![Message::Notification(n)],
         ParsedMessage::Keepalive => vec![Message::Keepalive],
         ParsedMessage::RouteRefresh { family } => vec![Message::RouteRefresh { family }],
@@ -2203,7 +2346,41 @@ pub fn validate_message(
     Ok(msgs.into_iter())
 }
 
-fn validate_update(update: ParsedUpdate, is_ebgp: bool) -> Result<Vec<Message>, Notification> {
+/// RFC 4271 §6.3: a syntactically correct NEXT_HOP that is semantically
+/// invalid: not a unicast address (0.0.0.0, multicast, class E) or the
+/// address of the receiving speaker.
+fn nexthop_is_invalid(nexthop: &Nexthop, local_addr: Option<IpAddr>) -> bool {
+    if local_addr.is_some_and(|l| l.to_canonical() == nexthop.addr().to_canonical()) {
+        return true;
+    }
+    match nexthop {
+        Nexthop::V4(a) => a.is_unspecified() || a.is_multicast() || a.octets()[0] >= 240,
+        Nexthop::V6(a) => a.is_unspecified() || a.is_multicast(),
+        Nexthop::V6LinkLocal(a, _) => a.is_multicast(),
+    }
+}
+
+/// Families whose next hop is the unicast forwarding address of the route,
+/// so `nexthop_is_invalid` applies.
+fn nexthop_is_forwarding_address(family: Family) -> bool {
+    matches!(
+        family,
+        Family::IPV4
+            | Family::IPV6
+            | Family::IPV4_MC
+            | Family::IPV6_MC
+            | Family::IPV4_MPLS
+            | Family::IPV6_MPLS
+            | Family::IPV4_VPN
+            | Family::IPV6_VPN
+    )
+}
+
+fn validate_update(
+    update: ParsedUpdate,
+    is_ebgp: bool,
+    local_addr: Option<IpAddr>,
+) -> Result<Vec<Message>, Notification> {
     match update {
         ParsedUpdate::EndOfRib(family) => Ok(vec![Message::Update(Update::EndOfRib(family))]),
         ParsedUpdate::Routes {
@@ -2234,21 +2411,33 @@ fn validate_update(update: ParsedUpdate, is_ebgp: bool) -> Result<Vec<Message>, 
                             | Family::IPV6_FLOWSPEC_VPN
                     )
             });
+            // RFC 5065 §3: a peer outside the confederation must not send
+            // AS_CONFED_SEQUENCE or AS_CONFED_SET segments.
+            let confed_from_ebgp = is_ebgp
+                && attrs
+                    .iter()
+                    .any(|a| a.code() == Attribute::AS_PATH && a.as_path_has_confed());
             let missing_mandatory = (reach.is_some() || mp_reach.is_some())
                 && (!attrs.iter().any(|a| a.code() == Attribute::ORIGIN)
                     || !attrs.iter().any(|a| a.code() == Attribute::AS_PATH)
                     || reach.as_ref().is_some_and(|r| r.nexthop.is_none())
                     || mp_reach_missing_nexthop);
 
-            // RFC 7606: classify each attribute error.
-            // Optional non-transitive: attribute discard (already absent from attrs).
-            // Well-known or optional transitive: treat-as-withdraw.
+            // RFC 7606 §3 (h): the strongest approach among the errors wins.
+            // Discarded attributes are already absent from attrs.
             let treat_as_withdraw = missing_mandatory
+                || confed_from_ebgp
                 || error_attrs.iter().any(|e| {
-                    let optional = e.attr_flags & Attribute::FLAG_OPTIONAL != 0;
-                    let transitive = e.attr_flags & Attribute::FLAG_TRANSITIVE != 0;
-                    !optional || transitive
+                    e.action(is_ebgp, reach.is_some()) == AttributeErrorAction::TreatAsWithdraw
                 });
+
+            // RFC 7606 §5.2: when an UPDATE carries no reachable NLRI we
+            // cannot be sure every NLRI was located (an attribute framing
+            // error may hide an MP_REACH_NLRI), so any error stronger than
+            // attribute discard requires a session reset.
+            if treat_as_withdraw && reach.is_none() && mp_reach.is_none() {
+                return Err(Notification::UpdateMalformedAttributeList);
+            }
 
             if treat_as_withdraw {
                 let mut msgs: Vec<Message> = Vec::new();
@@ -2290,14 +2479,29 @@ fn validate_update(update: ParsedUpdate, is_ebgp: bool) -> Result<Vec<Message>, 
             // Normal path: attribute-discard errors are already absent from attrs.
             let attr = Arc::new(attrs);
             let mut msgs: Vec<Message> = Vec::new();
+            // RFC 4271 §6.3: routes with a semantically invalid next hop are
+            // ignored, which for routes replacing earlier ones means withdrawn.
+            let to_message = |r: ReachNlri| {
+                let invalid = nexthop_is_forwarding_address(r.family)
+                    && r.nexthop
+                        .is_some_and(|n| nexthop_is_invalid(&n, local_addr));
+                if invalid {
+                    Message::Update(Update::Unreach {
+                        family: r.family,
+                        entries: r.entries,
+                    })
+                } else {
+                    Message::Update(Update::Reach {
+                        family: r.family,
+                        entries: r.entries,
+                        nexthop: r.nexthop,
+                        attr: attr.clone(),
+                    })
+                }
+            };
 
             if let Some(r) = reach {
-                msgs.push(Message::Update(Update::Reach {
-                    family: r.family,
-                    entries: r.entries,
-                    nexthop: r.nexthop,
-                    attr: attr.clone(),
-                }));
+                msgs.push(to_message(r));
             }
             if let Some(u) = unreach {
                 msgs.push(Message::Update(Update::Unreach {
@@ -2306,12 +2510,7 @@ fn validate_update(update: ParsedUpdate, is_ebgp: bool) -> Result<Vec<Message>, 
                 }));
             }
             if let Some(r) = mp_reach {
-                msgs.push(Message::Update(Update::Reach {
-                    family: r.family,
-                    entries: r.entries,
-                    nexthop: r.nexthop,
-                    attr,
-                }));
+                msgs.push(to_message(r));
             }
             if let Some(u) = mp_unreach {
                 msgs.push(Message::Update(Update::Unreach {
@@ -2342,11 +2541,16 @@ impl Message {
     }
 }
 
-/// Per-family negotiated ADD-PATH capability state.
+/// Per-family negotiated ADD-PATH and Extended Next Hop capability state.
 #[derive(Default)]
 pub struct FamilyState {
     pub addpath_rx: bool,
     pub addpath_tx: bool,
+    /// RFC 8950: we advertised Extended Next Hop for this IPv4 family, so
+    /// the peer may send us IPv6 next hops for it. The capability is a
+    /// receive capability: the peer's own advertisement only governs what
+    /// we may send.
+    pub extended_nexthop_rx: bool,
 }
 
 pub struct PeerCodec {
@@ -2435,6 +2639,7 @@ impl PeerCodec {
                     FamilyState {
                         addpath_rx,
                         addpath_tx,
+                        extended_nexthop_rx: lc.extended_nexthop,
                     },
                 );
             }
@@ -2831,6 +3036,9 @@ impl PeerCodec {
         };
         Nlri::decode(family, c, len, is_reach).map(|nlri| PathNlri { path_id: id, nlri })
     }
+
+    /// Decode an NLRI or Withdrawn Routes field. Any error is a syntax
+    /// error in the field: the caller sends Invalid Network Field.
     fn decode_nlri_list(
         family: Family,
         addpath_rx: bool,
@@ -3026,6 +3234,7 @@ impl PeerCodec {
                     if attr_end < c.position() + 2 {
                         break;
                     }
+                    let attr_start = c.position() as usize;
                     let flags = c.read_u8().map_err(|_| malformed())?;
                     let code = c.read_u8().map_err(|_| malformed())?;
                     let alen = if flags & Attribute::FLAG_EXTENDED != 0 {
@@ -3054,7 +3263,18 @@ impl PeerCodec {
                             if (flags ^ expected_flags)
                                 & (Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL)
                                 > 0
+                                || Attribute::partial_is_invalid(flags)
                             {
+                                if code == Attribute::MP_REACH || code == Attribute::MP_UNREACH {
+                                    // RFC 7606 §5.3: an MP attribute whose flags
+                                    // conflict with RFC 4760 is incorrect, so its
+                                    // NLRI cannot be used for treat-as-withdraw
+                                    // and §3 (j) requires a session reset.
+                                    let end = c.position() as usize + alen as usize;
+                                    return Err(Notification::UpdateAttributeFlagsError {
+                                        data: buf[attr_start..end].to_vec(),
+                                    });
+                                }
                                 c.set_position(c.position() + alen as u64);
                                 error_attrs.push(AttributeError {
                                     attr_code: code,
@@ -3169,7 +3389,8 @@ impl PeerCodec {
                         addpath_rx,
                         true,
                         &buf[c.position() as usize..],
-                    )?;
+                    )
+                    .map_err(|_| Notification::UpdateInvalidNetworkField)?;
                 }
 
                 if 0 < withdrawn_len {
@@ -3184,54 +3405,61 @@ impl PeerCodec {
                         addpath_rx,
                         false,
                         &buf[start..start + withdrawn_len as usize],
-                    )?;
+                    )
+                    .map_err(|_| Notification::UpdateInvalidNetworkField)?;
                 }
 
-                let mp_reach: Option<(Family, Vec<PathNlri>, Option<Nexthop>)> = if let Some(a) =
-                    mp_reach_attr
-                {
-                    let err = Notification::UpdateOptionalAttributeError;
-                    let buf = a.binary().unwrap();
-                    if buf.len() < 5 {
-                        return Err(err);
-                    }
-                    let mut c = Cursor::new(buf);
-                    let afi = c.read_u16::<NetworkEndian>().unwrap();
-                    let safi = c.read_u8().unwrap();
-                    let family = Family((afi as u32) << 16 | safi as u32);
-                    let addpath_rx = self.families.get(&family).ok_or_else(malformed)?.addpath_rx;
-                    let nexthop_len = c.read_u8().unwrap();
-                    if buf.len() < 5 + nexthop_len as usize {
-                        return Err(err);
-                    }
-                    let pos = c.position() as usize;
-                    let nexthop = if Nexthop::is_flowspec_family(family) {
-                        // RFC 8955 Section 4: "The Network Address of the
-                        // Next-Hop field MUST be ignored." Ignore any length,
-                        // like BIRD, so that the nexthop is never stored or
-                        // tracked by NHT.
-                        None
-                    } else {
-                        // Any other family with nexthop_len=0 is malformed;
-                        // from_bytes() also rejects a length or RD that does
-                        // not match the family.
-                        Some(
-                            Nexthop::from_bytes(family, &buf[pos..pos + nexthop_len as usize])
-                                .ok_or(err)?,
+                let mp_reach: Option<(Family, Vec<PathNlri>, Option<Nexthop>)> =
+                    if let Some(a) = mp_reach_attr {
+                        let err = Notification::UpdateOptionalAttributeError;
+                        let buf = a.binary().unwrap();
+                        if buf.len() < 5 {
+                            return Err(err);
+                        }
+                        let mut c = Cursor::new(buf);
+                        let afi = c.read_u16::<NetworkEndian>().unwrap();
+                        let safi = c.read_u8().unwrap();
+                        let family = Family((afi as u32) << 16 | safi as u32);
+                        let state = self.families.get(&family).ok_or_else(malformed)?;
+                        let addpath_rx = state.addpath_rx;
+                        let nexthop_len = c.read_u8().unwrap();
+                        if buf.len() < 5 + nexthop_len as usize {
+                            return Err(err);
+                        }
+                        // RFC 7606 §7.11: a next hop length that does not match
+                        // the family hides where the NLRI start; reset the session.
+                        if !Nexthop::len_is_valid(family, nexthop_len, state.extended_nexthop_rx) {
+                            return Err(err);
+                        }
+                        let pos = c.position() as usize;
+                        let nexthop = if Nexthop::is_flowspec_family(family) {
+                            // RFC 8955 Section 4: "The Network Address of the
+                            // Next-Hop field MUST be ignored." Ignore any length,
+                            // like BIRD, so that the nexthop is never stored or
+                            // tracked by NHT.
+                            None
+                        } else {
+                            // Any other family with nexthop_len=0 is malformed;
+                            // from_bytes() also rejects a length or RD that does
+                            // not match the family.
+                            Some(
+                                Nexthop::from_bytes(family, &buf[pos..pos + nexthop_len as usize])
+                                    .ok_or(err)?,
+                            )
+                        };
+                        c.set_position(pos as u64 + nexthop_len as u64);
+                        c.read_u8().unwrap();
+                        let entries = Self::decode_nlri_list(
+                            family,
+                            addpath_rx,
+                            true,
+                            &buf[c.position() as usize..],
                         )
+                        .map_err(|_| Notification::UpdateInvalidNetworkField)?;
+                        Some((family, entries, nexthop))
+                    } else {
+                        None
                     };
-                    c.set_position(pos as u64 + nexthop_len as u64);
-                    c.read_u8().unwrap();
-                    let entries = Self::decode_nlri_list(
-                        family,
-                        addpath_rx,
-                        true,
-                        &buf[c.position() as usize..],
-                    )?;
-                    Some((family, entries, nexthop))
-                } else {
-                    None
-                };
 
                 let mp_unreach: Option<(Family, Vec<PathNlri>)> = if let Some(a) = mp_unreach_attr {
                     let err = Notification::UpdateOptionalAttributeError;
@@ -3249,7 +3477,8 @@ impl PeerCodec {
                         addpath_rx,
                         false,
                         &buf[c.position() as usize..],
-                    )?;
+                    )
+                    .map_err(|_| Notification::UpdateInvalidNetworkField)?;
                     Some((family, entries))
                 } else {
                     None
@@ -6947,7 +7176,7 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
@@ -6962,13 +7191,14 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
 
     #[test]
-    fn malformed_aggregator_length_treat_as_withdraw() {
+    fn malformed_aggregator_length_discarded() {
+        // RFC 7606 §7.7: attribute discard.
         let mut attr_bytes = Vec::new();
         attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
         attr_bytes.extend_from_slice(&base_attrs_without_origin());
@@ -6977,13 +7207,17 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
-        assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
+        assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
+        if let Message::Update(Update::Reach { attr, .. }) = &msgs[0] {
+            assert!(attr.iter().all(|a| a.code() != Attribute::AGGREGATOR));
+        }
     }
 
     #[test]
-    fn malformed_cluster_list_length_discarded() {
+    fn malformed_cluster_list_length_treat_as_withdraw() {
+        // RFC 7606 §7.10: from an internal neighbor, treat-as-withdraw.
         let mut attr_bytes = Vec::new();
         attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
         attr_bytes.extend_from_slice(&base_attrs_without_origin());
@@ -6992,12 +7226,9 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
-        assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
-        if let Message::Update(Update::Reach { attr, .. }) = &msgs[0] {
-            assert!(attr.iter().all(|a| a.code() != Attribute::CLUSTER_LIST));
-        }
+        assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
 
     #[test]
@@ -7014,7 +7245,7 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
@@ -7033,7 +7264,7 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
@@ -7054,7 +7285,7 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, true).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, true, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
         if let Message::Update(Update::Reach { attr, .. }) = &msgs[0] {
@@ -7071,7 +7302,7 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         if let Message::Update(Update::Reach { attr, .. }) = &msgs[0] {
             assert!(attr.iter().any(|a| a.code() == Attribute::LOCAL_PREF));
@@ -7110,7 +7341,7 @@ mod update_tests {
         attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xc0, 0x00, 0x02, 0x01]);
         let buf = raw_update_with_attrs(&attr_bytes);
         let parsed = ipv4_codec().parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
@@ -7122,7 +7353,7 @@ mod update_tests {
         attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xc0, 0x00, 0x02, 0x01]);
         let buf = raw_update_with_attrs(&attr_bytes);
         let parsed = ipv4_codec().parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
@@ -7134,7 +7365,7 @@ mod update_tests {
         attr_bytes.extend_from_slice(&[0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xea]);
         let buf = raw_update_with_attrs(&attr_bytes);
         let parsed = ipv4_codec().parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
@@ -7143,7 +7374,7 @@ mod update_tests {
     fn missing_nexthop_attr_with_mpreach_ok() {
         let buf = raw_ipv6_mpreach_update();
         let parsed = ipv6_codec().parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
     }
@@ -7178,7 +7409,7 @@ mod update_tests {
         let mut codec = PeerCodec::new();
         codec.set_family(Family::IPV4_FLOWSPEC, Default::default());
         let parsed = codec.parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
     }
@@ -7228,7 +7459,7 @@ mod update_tests {
         let mut codec = ipv4_codec();
         let buf = update_with_aigp(0x80);
         let parsed = codec.parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert!(
             msgs.iter()
                 .any(|m| matches!(m, Message::Update(Update::Reach { .. })))
@@ -7240,7 +7471,7 @@ mod update_tests {
         let mut codec = ipv4_codec();
         let buf = update_with_aigp(0xC0);
         let parsed = codec.parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert!(
             msgs.iter()
                 .all(|m| matches!(m, Message::Update(Update::Unreach { .. })))
@@ -7252,7 +7483,7 @@ mod update_tests {
         let mut codec = ipv4_codec();
         let buf = update_with_unknown_optional_attrs();
         let parsed = codec.parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         let attr = match &msgs[0] {
             Message::Update(Update::Reach { attr, .. }) => attr,
             _ => panic!("expected Reach message"),
@@ -7272,12 +7503,608 @@ mod update_tests {
         let mut codec = ipv4_codec();
         let buf = update_with_unknown_optional_attrs();
         let parsed = codec.parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         let attr = match &msgs[0] {
             Message::Update(Update::Reach { attr, .. }) => attr,
             _ => panic!("expected Reach message"),
         };
         assert!(attr.iter().all(|a| a.code() != 201));
+    }
+
+    // RFC 7606 helpers: build an UPDATE from its three variable fields.
+    fn raw_update(withdrawn: &[u8], attrs: &[u8], nlri: &[u8]) -> Vec<u8> {
+        let total = 19 + 2 + withdrawn.len() + 2 + attrs.len() + nlri.len();
+        let mut buf = vec![0xffu8; 16];
+        buf.extend_from_slice(&(total as u16).to_be_bytes());
+        buf.push(2);
+        buf.extend_from_slice(&(withdrawn.len() as u16).to_be_bytes());
+        buf.extend_from_slice(withdrawn);
+        buf.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+        buf.extend_from_slice(attrs);
+        buf.extend_from_slice(nlri);
+        buf
+    }
+
+    fn mp_reach_attr(flags: u8, family: Family, nexthop: &[u8], nlri: &[u8]) -> Vec<u8> {
+        let mut v = vec![
+            flags,
+            Attribute::MP_REACH,
+            (5 + nexthop.len() + nlri.len()) as u8,
+        ];
+        v.extend_from_slice(&family.afi().to_be_bytes());
+        v.push(family.safi());
+        v.push(nexthop.len() as u8);
+        v.extend_from_slice(nexthop);
+        v.push(0);
+        v.extend_from_slice(nlri);
+        v
+    }
+
+    fn mp_unreach_attr(flags: u8, family: Family, nlri: &[u8]) -> Vec<u8> {
+        let mut v = vec![flags, Attribute::MP_UNREACH, (3 + nlri.len()) as u8];
+        v.extend_from_slice(&family.afi().to_be_bytes());
+        v.push(family.safi());
+        v.extend_from_slice(nlri);
+        v
+    }
+
+    /// ORIGIN IGP, AS_PATH [65002], NEXT_HOP 192.0.2.1.
+    fn base_attrs() -> Vec<u8> {
+        let mut v = vec![0x40, 0x01, 0x01, 0x00];
+        v.extend_from_slice(&base_attrs_without_origin());
+        v
+    }
+
+    const V6_NEXTHOP: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    /// 2001:db8::/32
+    const V6_NLRI: [u8; 5] = [0x20, 0x20, 0x01, 0x0d, 0xb8];
+
+    fn validate(
+        codec: &mut PeerCodec,
+        buf: &[u8],
+        is_ebgp: bool,
+    ) -> Result<Vec<Message>, Notification> {
+        let parsed = codec.parse_message(buf).expect("parse must not fail");
+        validate_message(parsed, is_ebgp, None).map(|i| i.collect())
+    }
+
+    fn is_unreach(m: &Message, family: Family) -> bool {
+        matches!(m, Message::Update(Update::Unreach { family: f, .. }) if *f == family)
+    }
+
+    fn dual_codec() -> PeerCodec {
+        let mut c = PeerCodec::new();
+        c.set_family(Family::IPV4, Default::default());
+        c.set_family(Family::IPV6, Default::default());
+        c
+    }
+
+    #[test]
+    fn mp_reach_with_bad_flags_resets_session() {
+        // RFC 7606 §5.3: MP_REACH_NLRI with conflicting flags is incorrect;
+        // §3 (j) then requires a session reset.
+        let mp = mp_reach_attr(0xC0, Family::IPV6, &V6_NEXTHOP, &V6_NLRI);
+        let mut attrs = base_attrs();
+        attrs.extend_from_slice(&mp);
+        let buf = raw_update(&[], &attrs, &[]);
+        match ipv6_codec().parse_message(&buf) {
+            Err(Notification::UpdateAttributeFlagsError { data }) => assert_eq!(data, mp),
+            Err(e) => panic!("expected UpdateAttributeFlagsError, got {e}"),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    #[test]
+    fn mp_unreach_with_bad_flags_resets_session() {
+        let mp = mp_unreach_attr(0x40, Family::IPV6, &V6_NLRI);
+        let buf = raw_update(&[], &mp, &[]);
+        match ipv6_codec().parse_message(&buf) {
+            Err(Notification::UpdateAttributeFlagsError { data }) => assert_eq!(data, mp),
+            Err(e) => panic!("expected UpdateAttributeFlagsError, got {e}"),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    /// MULTI_EXIT_DISC whose length runs past the end of the attributes.
+    const MED_OVERRUN: [u8; 4] = [0x80, 0x04, 0x40, 0x00];
+
+    #[test]
+    fn framing_error_without_reachable_nlri_resets_session() {
+        // RFC 7606 §5.2: the overrun could hide an MP_REACH_NLRI, so the
+        // NLRI cannot be located and treat-as-withdraw is not possible.
+        let mut attrs = mp_unreach_attr(0x80, Family::IPV6, &V6_NLRI);
+        attrs.extend_from_slice(&base_attrs());
+        attrs.extend_from_slice(&MED_OVERRUN);
+        let buf = raw_update(&[], &attrs, &[]);
+        match validate(&mut ipv6_codec(), &buf, false) {
+            Err(Notification::UpdateMalformedAttributeList) => {}
+            r => panic!(
+                "expected UpdateMalformedAttributeList, got {:?}",
+                r.map(|m| m.len())
+            ),
+        }
+    }
+
+    #[test]
+    fn framing_error_after_mp_reach_withdraws_mp_nlri() {
+        // RFC 7606 §4: the MP_REACH_NLRI located before the overrun is
+        // treated as withdrawn.
+        let mut attrs = mp_reach_attr(0x80, Family::IPV6, &V6_NEXTHOP, &V6_NLRI);
+        attrs.extend_from_slice(&base_attrs());
+        attrs.extend_from_slice(&MED_OVERRUN);
+        let buf = raw_update(&[], &attrs, &[]);
+        let msgs = validate(&mut ipv6_codec(), &buf, false).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(is_unreach(&msgs[0], Family::IPV6));
+    }
+
+    #[test]
+    fn framing_error_with_legacy_nlri_withdraws_legacy_and_mp_unreach() {
+        let mut attrs = mp_unreach_attr(0x80, Family::IPV6, &V6_NLRI);
+        attrs.extend_from_slice(&base_attrs());
+        attrs.extend_from_slice(&MED_OVERRUN);
+        let buf = raw_update(&[], &attrs, &[0x08, 0x0a]);
+        let msgs = validate(&mut dual_codec(), &buf, false).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(is_unreach(&msgs[0], Family::IPV4));
+        assert!(is_unreach(&msgs[1], Family::IPV6));
+    }
+
+    /// Validate an IPv4 UPDATE carrying the base attributes plus `extra`
+    /// and return whether its NLRI was treat-as-withdrawn; panics on reset.
+    fn withdrawn_with(extra: &[u8], is_ebgp: bool) -> (bool, Vec<Message>) {
+        let mut attrs = base_attrs();
+        attrs.extend_from_slice(extra);
+        let buf = raw_update(&[], &attrs, &[0x08, 0x0a]);
+        let msgs = validate(&mut ipv4_codec(), &buf, is_ebgp).expect("no session reset");
+        assert_eq!(msgs.len(), 1);
+        (is_unreach(&msgs[0], Family::IPV4), msgs)
+    }
+
+    fn reach_attrs(msgs: &[Message]) -> Arc<Vec<Attribute>> {
+        match &msgs[0] {
+            Message::Update(Update::Reach { attr, .. }) => attr.clone(),
+            _ => panic!("expected Reach"),
+        }
+    }
+
+    #[test]
+    fn rfc7606_treat_as_withdraw_attributes() {
+        for (name, extra) in [
+            ("MED length 3 (§7.4)", &[0x80, 0x04, 0x03, 0, 0, 1][..]),
+            (
+                "LOCAL_PREF length 3 (§7.5)",
+                &[0x40, 0x05, 0x03, 0, 0, 1][..],
+            ),
+            (
+                "ORIGINATOR_ID length 3 (§7.9)",
+                &[0x80, 0x09, 0x03, 0, 0, 1][..],
+            ),
+            (
+                "CLUSTER_LIST length 3 (§7.10)",
+                &[0x80, 0x0a, 0x03, 0, 0, 1][..],
+            ),
+            (
+                "COMMUNITY length 3 (§7.8)",
+                &[0xc0, 0x08, 0x03, 0, 0, 1][..],
+            ),
+            (
+                "EXT_COMMUNITY length 7 (§7.14)",
+                &[0xc0, 0x10, 0x07, 0, 0, 0, 0, 0, 0, 1][..],
+            ),
+            (
+                "LARGE_COMMUNITY length 4 (RFC 8092)",
+                &[0xc0, 0x20, 0x04, 0, 0, 0, 1][..],
+            ),
+            // §3 (c): flag conflicts, also on attributes whose malformed
+            // contents would only be discarded.
+            (
+                "AGGREGATOR well-known flags",
+                &[0x40, 0x07, 0x08, 0, 0, 0, 1, 192, 0, 2, 1][..],
+            ),
+            ("ATOMIC_AGGREGATE optional flags", &[0xc0, 0x06, 0x00][..]),
+            ("MED transitive flags", &[0xc0, 0x04, 0x04, 0, 0, 0, 1][..]),
+        ] {
+            let (withdrawn, _) = withdrawn_with(extra, false);
+            assert!(withdrawn, "{name}: expected treat-as-withdraw");
+        }
+    }
+
+    #[test]
+    fn rfc7606_attribute_discard_attributes() {
+        for (name, code, extra, is_ebgp) in [
+            (
+                "ATOMIC_AGGREGATE length 1 (§7.6)",
+                Attribute::ATOMIC_AGGREGATE,
+                &[0x40, 0x06, 0x01, 0][..],
+                false,
+            ),
+            (
+                "AGGREGATOR length 3 (§7.7)",
+                Attribute::AGGREGATOR,
+                &[0xc0, 0x07, 0x03, 0, 1, 0][..],
+                false,
+            ),
+            (
+                "eBGP LOCAL_PREF length 3 (§7.5)",
+                Attribute::LOCAL_PREF,
+                &[0x40, 0x05, 0x03, 0, 0, 1][..],
+                true,
+            ),
+            (
+                "eBGP LOCAL_PREF bad flags (§7.5)",
+                Attribute::LOCAL_PREF,
+                &[0x80, 0x05, 0x04, 0, 0, 0, 1][..],
+                true,
+            ),
+            (
+                "eBGP ORIGINATOR_ID length 3 (§7.9)",
+                Attribute::ORIGINATOR_ID,
+                &[0x80, 0x09, 0x03, 0, 0, 1][..],
+                true,
+            ),
+            (
+                "eBGP CLUSTER_LIST length 3 (§7.10)",
+                Attribute::CLUSTER_LIST,
+                &[0x80, 0x0a, 0x03, 0, 0, 1][..],
+                true,
+            ),
+        ] {
+            let (withdrawn, msgs) = withdrawn_with(extra, is_ebgp);
+            assert!(!withdrawn, "{name}: expected attribute discard");
+            assert!(
+                reach_attrs(&msgs).iter().all(|a| a.code() != code),
+                "{name}: attribute must be discarded"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_nexthop_without_nlri_field_is_ignored() {
+        // RFC 4760 §3: NEXT_HOP is ignored when only MP_REACH_NLRI carries
+        // NLRI, so a malformed one is discarded.
+        let mut attrs = vec![0x40, 0x01, 0x01, 0x00, 0x40, 0x02, 0x00];
+        attrs.extend_from_slice(&[0x40, 0x03, 0x02, 0, 0]);
+        attrs.extend_from_slice(&mp_reach_attr(0x80, Family::IPV6, &V6_NEXTHOP, &V6_NLRI));
+        let buf = raw_update(&[], &attrs, &[]);
+        let msgs = validate(&mut ipv6_codec(), &buf, false).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
+    }
+
+    fn ipv4_update_with_nexthop(nexthop: &[u8]) -> Vec<u8> {
+        let mut attrs = vec![0x40, 0x01, 0x01, 0x00, 0x40, 0x02, 0x00, 0x40, 0x03];
+        attrs.push(nexthop.len() as u8);
+        attrs.extend_from_slice(nexthop);
+        raw_update(&[], &attrs, &[0x08, 0x0a])
+    }
+
+    #[test]
+    fn nexthop_length_must_be_4() {
+        // RFC 7606 §7.3: treat-as-withdraw.
+        for nh in [&[192, 0, 2][..], &[192, 0, 2, 1, 0], &[0x20; 16], &[]] {
+            let buf = ipv4_update_with_nexthop(nh);
+            let msgs = validate(&mut ipv4_codec(), &buf, false).unwrap();
+            assert_eq!(msgs.len(), 1);
+            assert!(
+                is_unreach(&msgs[0], Family::IPV4),
+                "{}-byte NEXT_HOP",
+                nh.len()
+            );
+        }
+    }
+
+    #[test]
+    fn semantically_invalid_nexthop_treat_as_withdraw() {
+        // RFC 4271 §6.3.
+        let local: IpAddr = "192.0.2.254".parse().unwrap();
+        for nh in [
+            [0, 0, 0, 0],
+            [224, 0, 0, 1],
+            [239, 255, 255, 255],
+            [240, 0, 0, 1],
+            [255, 255, 255, 255],
+            [192, 0, 2, 254],
+        ] {
+            let buf = ipv4_update_with_nexthop(&nh);
+            let parsed = ipv4_codec().parse_message(&buf).unwrap();
+            let msgs: Vec<Message> = validate_message(parsed, false, Some(local))
+                .unwrap()
+                .collect();
+            assert_eq!(msgs.len(), 1);
+            assert!(is_unreach(&msgs[0], Family::IPV4), "NEXT_HOP {nh:?}");
+        }
+        let buf = ipv4_update_with_nexthop(&[192, 0, 2, 1]);
+        let parsed = ipv4_codec().parse_message(&buf).unwrap();
+        let msgs: Vec<Message> = validate_message(parsed, false, Some(local))
+            .unwrap()
+            .collect();
+        assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
+    }
+
+    #[test]
+    fn semantically_invalid_mp_nexthop_treat_as_withdraw() {
+        let local: IpAddr = "2001:db8::fe".parse().unwrap();
+        for nh in ["::", "ff02::1", "2001:db8::fe"] {
+            let nh = Ipv6Addr::from_str(nh).unwrap().octets();
+            let mut attrs = vec![0x40, 0x01, 0x01, 0x00, 0x40, 0x02, 0x00];
+            attrs.extend_from_slice(&mp_reach_attr(0x80, Family::IPV6, &nh, &V6_NLRI));
+            let buf = raw_update(&[], &attrs, &[]);
+            let parsed = ipv6_codec().parse_message(&buf).unwrap();
+            let msgs: Vec<Message> = validate_message(parsed, false, Some(local))
+                .unwrap()
+                .collect();
+            assert_eq!(msgs.len(), 1);
+            assert!(is_unreach(&msgs[0], Family::IPV6), "next hop {nh:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_legacy_nexthop_keeps_mp_reach() {
+        // Only the routes using the invalid next hop are withdrawn.
+        let mut attrs = vec![0x40, 0x01, 0x01, 0x00, 0x40, 0x02, 0x00];
+        attrs.extend_from_slice(&[0x40, 0x03, 0x04, 0, 0, 0, 0]);
+        attrs.extend_from_slice(&mp_reach_attr(0x80, Family::IPV6, &V6_NEXTHOP, &V6_NLRI));
+        let buf = raw_update(&[], &attrs, &[0x08, 0x0a]);
+        let msgs = validate(&mut dual_codec(), &buf, false).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(is_unreach(&msgs[0], Family::IPV4));
+        assert!(matches!(
+            &msgs[1],
+            Message::Update(Update::Reach {
+                family: Family::IPV6,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn mp_reach_nexthop_length_per_afi() {
+        // RFC 7606 §7.11: an unexpected next hop length resets the session.
+        let v4 = [192, 0, 2, 1];
+        let v6 = V6_NEXTHOP;
+        let ll = Ipv6Addr::from_str("fe80::1").unwrap().octets();
+        let cat = |parts: &[&[u8]]| parts.concat();
+        let rd = [0u8; 8];
+        let enh_caps = |f: Family| {
+            vec![
+                Capability::MultiProtocol(f),
+                Capability::ExtendedNexthop(vec![(f, Family::AFI_IP6)]),
+            ]
+        };
+        for (family, nexthop, enh, ok) in [
+            (Family::IPV6, v4.to_vec(), false, false),
+            (Family::IPV6, v6.to_vec(), false, true),
+            (Family::IPV6, cat(&[&v6, &ll]), false, true),
+            // RFC 2545 §3: the second address must be link-local.
+            (Family::IPV6, cat(&[&v6, &v6]), false, false),
+            (Family::IPV6_MPLS, v4.to_vec(), false, false),
+            (Family::IPV4, v4.to_vec(), false, true),
+            // RFC 8950: an IPv6 next hop needs our capability.
+            (Family::IPV4, v6.to_vec(), false, false),
+            (Family::IPV4, v6.to_vec(), true, true),
+            (Family::IPV4, cat(&[&v6, &ll]), true, true),
+            (Family::IPV4_VPN, cat(&[&rd, &v4]), false, true),
+            (Family::IPV4_VPN, cat(&[&rd, &v6]), false, false),
+            (Family::IPV4_VPN, cat(&[&rd, &v6]), true, true),
+        ] {
+            let caps = if enh {
+                enh_caps(family)
+            } else {
+                vec![Capability::MultiProtocol(family)]
+            };
+            // Only our side advertises Extended Next Hop (RFC 8950 §4).
+            let remote = vec![Capability::MultiProtocol(family)];
+            let mut codec = PeerCodec::negotiate(&caps, &remote);
+            let buf = mp_reach_nexthop_update(family, &nexthop);
+            match codec.parse_message(&buf) {
+                Ok(_) if ok => {}
+                Err(Notification::UpdateOptionalAttributeError) if !ok => {}
+                r => panic!(
+                    "{family:?} {}-byte next hop, extended nexthop {enh}: got {:?}",
+                    nexthop.len(),
+                    r.err()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn extended_nexthop_rx_follows_local_advertisement_per_family() {
+        // RFC 8950 §4: a speaker may send an IPv6 next hop only if its peer
+        // advertised the capability, so what we accept depends on our own
+        // advertisement, per family.
+        let local = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::MultiProtocol(Family::IPV4_VPN),
+            Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
+        ];
+        let remote = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::MultiProtocol(Family::IPV4_VPN),
+        ];
+        let codec = PeerCodec::negotiate(&local, &remote);
+        assert!(
+            codec
+                .family_state(Family::IPV4)
+                .unwrap()
+                .extended_nexthop_rx
+        );
+        assert!(
+            !codec
+                .family_state(Family::IPV4_VPN)
+                .unwrap()
+                .extended_nexthop_rx
+        );
+        // The peer's advertisement alone does not let it send to us.
+        let codec = PeerCodec::negotiate(&remote, &local);
+        assert!(
+            !codec
+                .family_state(Family::IPV4)
+                .unwrap()
+                .extended_nexthop_rx
+        );
+    }
+
+    /// ORIGIN IGP, `as_path` as the AS_PATH value, NEXT_HOP 192.0.2.1.
+    fn update_with_as_path(as_path: &[u8]) -> Vec<u8> {
+        let mut attrs = vec![0x40, 0x01, 0x01, 0x00, 0x40, 0x02, as_path.len() as u8];
+        attrs.extend_from_slice(as_path);
+        attrs.extend_from_slice(&[0x40, 0x03, 0x04, 192, 0, 2, 1]);
+        raw_update(&[], &attrs, &[0x08, 0x0a])
+    }
+
+    #[test]
+    fn as_path_zero_length_segment_treat_as_withdraw() {
+        // RFC 7606 §7.2.
+        let four = [0x02, 0x01, 0, 0, 0xfd, 0xea, 0x02, 0x00];
+        let buf = update_with_as_path(&four);
+        let msgs = validate(&mut ipv4_codec(), &buf, false).unwrap();
+        assert!(is_unreach(&msgs[0], Family::IPV4));
+
+        let two = [0x02, 0x01, 0xfd, 0xea, 0x01, 0x00];
+        let buf = update_with_as_path(&two);
+        let mut codec = ipv4_codec();
+        codec.two_byte_as = true;
+        let msgs = validate(&mut codec, &buf, false).unwrap();
+        assert!(is_unreach(&msgs[0], Family::IPV4));
+    }
+
+    #[test]
+    fn confed_segment_from_ebgp_treat_as_withdraw() {
+        // RFC 5065 §3.
+        for seg_type in [
+            Attribute::AS_PATH_TYPE_CONFED_SEQ,
+            Attribute::AS_PATH_TYPE_CONFED_SET,
+        ] {
+            let as_path = [
+                seg_type, 0x01, 0, 0, 0xfd, 0xe9, 0x02, 0x01, 0, 0, 0xfd, 0xea,
+            ];
+            let buf = update_with_as_path(&as_path);
+            let msgs = validate(&mut ipv4_codec(), &buf, true).unwrap();
+            assert!(is_unreach(&msgs[0], Family::IPV4), "eBGP, type {seg_type}");
+            // A confederation or internal peer may send them.
+            let msgs = validate(&mut ipv4_codec(), &buf, false).unwrap();
+            assert!(
+                matches!(&msgs[0], Message::Update(Update::Reach { .. })),
+                "iBGP, type {seg_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_list_attributes_treat_as_withdraw() {
+        for code in [
+            Attribute::COMMUNITY,
+            Attribute::EXTENDED_COMMUNITY,
+            Attribute::LARGE_COMMUNITY,
+            Attribute::CLUSTER_LIST,
+        ] {
+            let flags = Attribute::canonical_flags(code).unwrap();
+            let (withdrawn, _) = withdrawn_with(&[flags, code, 0], false);
+            assert!(withdrawn, "empty attribute {code}");
+        }
+    }
+
+    #[test]
+    fn empty_list_attributes_are_not_encoded() {
+        let attr = Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::empty_as_path(),
+            Attribute::new_with_bin(Attribute::COMMUNITY, vec![]).unwrap(),
+            Attribute::new_with_bin(Attribute::EXTENDED_COMMUNITY, vec![]).unwrap(),
+            Attribute::new_with_bin(Attribute::LARGE_COMMUNITY, vec![]).unwrap(),
+        ]);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![PathNlri::new("10.0.0.0/8".parse().unwrap())],
+            nexthop: Some(Nexthop::V4(Ipv4Addr::new(192, 0, 2, 1))),
+            attr,
+        });
+        let mut buf = BytesMut::new();
+        ipv4_codec().encode_to(&msg, &mut buf).unwrap();
+        let msgs = validate(&mut ipv4_codec(), &buf, false).unwrap();
+        assert_eq!(msgs.len(), 1);
+        let attrs = reach_attrs(&msgs);
+        assert!(attrs.iter().all(|a| !matches!(
+            a.code(),
+            Attribute::COMMUNITY | Attribute::EXTENDED_COMMUNITY | Attribute::LARGE_COMMUNITY
+        )));
+    }
+
+    #[test]
+    fn partial_bit_on_well_known_or_non_transitive_treat_as_withdraw() {
+        // RFC 4271 §4.3: the Partial bit must be 0 for these attributes.
+        for (name, extra) in [
+            ("ATOMIC_AGGREGATE", &[0x60, 0x06, 0x00][..]),
+            ("MED", &[0xa0, 0x04, 0x04, 0, 0, 0, 1][..]),
+        ] {
+            let (withdrawn, _) = withdrawn_with(extra, false);
+            assert!(withdrawn, "{name} with Partial bit");
+        }
+        // Optional transitive attributes may carry it.
+        let (withdrawn, msgs) = withdrawn_with(&[0xe0, 0x08, 0x04, 0xfd, 0xe9, 0, 1], false);
+        assert!(!withdrawn);
+        assert!(
+            reach_attrs(&msgs)
+                .iter()
+                .any(|a| a.code() == Attribute::COMMUNITY)
+        );
+    }
+
+    #[test]
+    fn partial_bit_on_mp_reach_resets_session() {
+        let mp = mp_reach_attr(0xa0, Family::IPV6, &V6_NEXTHOP, &V6_NLRI);
+        let mut attrs = base_attrs();
+        attrs.extend_from_slice(&mp);
+        let buf = raw_update(&[], &attrs, &[]);
+        assert!(matches!(
+            ipv6_codec().parse_message(&buf),
+            Err(Notification::UpdateAttributeFlagsError { .. })
+        ));
+    }
+
+    #[test]
+    fn nlri_syntax_errors_send_invalid_network_field() {
+        // RFC 4271 §6.3, RFC 7606 §5.3: prefix length over 32, or a prefix
+        // running past the end of the field.
+        for bad in [&[33, 10, 0, 0, 0, 0][..], &[24, 10, 0][..]] {
+            for (withdrawn, nlri) in [(bad, &[][..]), (&[][..], bad)] {
+                let attrs = if nlri.is_empty() {
+                    vec![]
+                } else {
+                    base_attrs()
+                };
+                let buf = raw_update(withdrawn, &attrs, nlri);
+                match ipv4_codec().parse_message(&buf) {
+                    Err(Notification::UpdateInvalidNetworkField) => {}
+                    r => panic!("{bad:?}: expected Invalid Network Field, got {:?}", r.err()),
+                }
+            }
+        }
+        let mut codec = ipv6_codec();
+        for mp in [
+            mp_reach_attr(0x80, Family::IPV6, &V6_NEXTHOP, &[129, 0x20]),
+            mp_unreach_attr(0x80, Family::IPV6, &[64, 0x20, 0x01]),
+        ] {
+            let buf = raw_update(&[], &mp, &[]);
+            match codec.parse_message(&buf) {
+                Err(Notification::UpdateInvalidNetworkField) => {}
+                r => panic!("expected Invalid Network Field, got {:?}", r.err()),
+            }
+        }
+    }
+
+    #[test]
+    fn attribute_error_in_withdraw_only_update_resets_session() {
+        // RFC 7606 §5.2: path attributes but no reachable NLRI.
+        let mut attrs = base_attrs();
+        attrs.extend_from_slice(&[0xC0, 0x08, 0x03, 0, 0, 1]);
+        let buf = raw_update(&[0x08, 0x0a], &attrs, &[]);
+        assert!(matches!(
+            validate(&mut ipv4_codec(), &buf, false),
+            Err(Notification::UpdateMalformedAttributeList)
+        ));
     }
 }
 
@@ -7623,7 +8450,7 @@ mod two_byte_as_tests {
         let parsed = ipv4_codec_2byte_as()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         // RFC 6793 §6 mandates plain attribute discard, not treat-as-withdraw.
         match &msgs[0] {
@@ -7652,7 +8479,7 @@ mod two_byte_as_tests {
         let parsed = ipv4_codec_2byte_as()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
     }

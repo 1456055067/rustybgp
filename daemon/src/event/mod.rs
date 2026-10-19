@@ -3735,7 +3735,7 @@ impl PeerSession {
                                         // Count one wire frame before validate_message moves `parsed`.
                                         (*self.counter_rx).sync_rx(&parsed);
                                         let is_ebgp = matches!(self.export_ctx.role, PeerRole::Ebgp);
-                                        match bgp::validate_message(parsed, is_ebgp) {
+                                        match bgp::validate_message(parsed, is_ebgp, Some(local_sockaddr.ip())) {
                                             Err(notif) => {
                                                 return Step::Terminate {
                                                     reason: crate::fsm::SessionDownReason::LocalNotification(bgp::Message::Notification(notif.clone())),
