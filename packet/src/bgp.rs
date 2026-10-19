@@ -2123,12 +2123,74 @@ pub struct ReachNlri {
 }
 
 /// One attribute that could not be parsed (RFC 7606).
-/// The caller uses `attr_flags` to determine the RFC 7606 action:
-/// optional + transitive -> discard; otherwise -> treat-as-withdraw.
+/// `AttributeError::action` gives the RFC 7606 approach for it.
 #[derive(Clone, Debug)]
 pub struct AttributeError {
     pub attr_code: u8,
     pub attr_flags: u8,
+}
+
+/// RFC 7606 §2 error-handling approaches that keep the session up,
+/// weakest first. A session reset is returned as a `Notification`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AttributeErrorAction {
+    AttributeDiscard,
+    TreatAsWithdraw,
+}
+
+impl AttributeError {
+    /// True when the received Optional or Transitive bit conflicts with
+    /// the attribute's definition.
+    fn flags_conflict(&self) -> bool {
+        Attribute::canonical_flags(self.attr_code).is_some_and(|expected| {
+            (self.attr_flags ^ expected) & (Attribute::FLAG_OPTIONAL | Attribute::FLAG_TRANSITIVE)
+                != 0
+        })
+    }
+
+    /// The RFC 7606 approach for this error. The approach is defined per
+    /// attribute (RFC 7606 §7), not derived from the received flags.
+    ///
+    /// `is_ebgp` is true for a non-confederation eBGP peer.
+    /// `has_legacy_nlri` is true when the UPDATE has a non-empty NLRI field.
+    pub fn action(&self, is_ebgp: bool, has_legacy_nlri: bool) -> AttributeErrorAction {
+        use AttributeErrorAction::*;
+        let optional = self.attr_flags & Attribute::FLAG_OPTIONAL != 0;
+        let transitive = self.attr_flags & Attribute::FLAG_TRANSITIVE != 0;
+        match self.attr_code {
+            // §7.5, §7.9, §7.10: discarded when received from an external
+            // neighbor, however they are malformed.
+            Attribute::LOCAL_PREF | Attribute::ORIGINATOR_ID | Attribute::CLUSTER_LIST
+                if is_ebgp =>
+            {
+                AttributeDiscard
+            }
+            // RFC 4760 §3: NEXT_HOP is ignored when there is no NLRI field.
+            Attribute::NEXTHOP if !has_legacy_nlri => AttributeDiscard,
+            // §3 (c): a flag conflict makes the attribute malformed and is
+            // handled by treat-as-withdraw.
+            _ if self.flags_conflict() => TreatAsWithdraw,
+            // §3 (f), §7.6, §7.7.
+            Attribute::ATOMIC_AGGREGATE | Attribute::AGGREGATOR => AttributeDiscard,
+            // RFC 6793 §6.
+            Attribute::AS4_PATH | Attribute::AS4_AGGREGATOR => AttributeDiscard,
+            // §3 (e), §7.1-§7.5, §7.8-§7.10, §7.14; RFC 8092 §6.
+            Attribute::ORIGIN
+            | Attribute::AS_PATH
+            | Attribute::NEXTHOP
+            | Attribute::MULTI_EXIT_DESC
+            | Attribute::LOCAL_PREF
+            | Attribute::COMMUNITY
+            | Attribute::ORIGINATOR_ID
+            | Attribute::CLUSTER_LIST
+            | Attribute::EXTENDED_COMMUNITY
+            | Attribute::LARGE_COMMUNITY => TreatAsWithdraw,
+            // No specific rule: an optional non-transitive attribute only
+            // affects this hop, so discard it; withdraw otherwise.
+            _ if optional && !transitive => AttributeDiscard,
+            _ => TreatAsWithdraw,
+        }
+    }
 }
 
 /// A parsed BGP UPDATE message (receive path).
@@ -2240,14 +2302,11 @@ fn validate_update(update: ParsedUpdate, is_ebgp: bool) -> Result<Vec<Message>, 
                     || reach.as_ref().is_some_and(|r| r.nexthop.is_none())
                     || mp_reach_missing_nexthop);
 
-            // RFC 7606: classify each attribute error.
-            // Optional non-transitive: attribute discard (already absent from attrs).
-            // Well-known or optional transitive: treat-as-withdraw.
+            // RFC 7606 §3 (h): the strongest approach among the errors wins.
+            // Discarded attributes are already absent from attrs.
             let treat_as_withdraw = missing_mandatory
                 || error_attrs.iter().any(|e| {
-                    let optional = e.attr_flags & Attribute::FLAG_OPTIONAL != 0;
-                    let transitive = e.attr_flags & Attribute::FLAG_TRANSITIVE != 0;
-                    !optional || transitive
+                    e.action(is_ebgp, reach.is_some()) == AttributeErrorAction::TreatAsWithdraw
                 });
 
             // RFC 7606 §5.2: when an UPDATE carries no reachable NLRI we
@@ -6987,7 +7046,8 @@ mod update_tests {
     }
 
     #[test]
-    fn malformed_aggregator_length_treat_as_withdraw() {
+    fn malformed_aggregator_length_discarded() {
+        // RFC 7606 §7.7: attribute discard.
         let mut attr_bytes = Vec::new();
         attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
         attr_bytes.extend_from_slice(&base_attrs_without_origin());
@@ -6998,11 +7058,15 @@ mod update_tests {
             .expect("parse must not fail");
         let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
         assert_eq!(msgs.len(), 1);
-        assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
+        assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
+        if let Message::Update(Update::Reach { attr, .. }) = &msgs[0] {
+            assert!(attr.iter().all(|a| a.code() != Attribute::AGGREGATOR));
+        }
     }
 
     #[test]
-    fn malformed_cluster_list_length_discarded() {
+    fn malformed_cluster_list_length_treat_as_withdraw() {
+        // RFC 7606 §7.10: from an internal neighbor, treat-as-withdraw.
         let mut attr_bytes = Vec::new();
         attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
         attr_bytes.extend_from_slice(&base_attrs_without_origin());
@@ -7013,10 +7077,7 @@ mod update_tests {
             .expect("parse must not fail");
         let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
         assert_eq!(msgs.len(), 1);
-        assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
-        if let Message::Update(Update::Reach { attr, .. }) = &msgs[0] {
-            assert!(attr.iter().all(|a| a.code() != Attribute::CLUSTER_LIST));
-        }
+        assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
 
     #[test]
@@ -7436,6 +7497,128 @@ mod update_tests {
         assert_eq!(msgs.len(), 2);
         assert!(is_unreach(&msgs[0], Family::IPV4));
         assert!(is_unreach(&msgs[1], Family::IPV6));
+    }
+
+    /// Validate an IPv4 UPDATE carrying the base attributes plus `extra`
+    /// and return whether its NLRI was treat-as-withdrawn; panics on reset.
+    fn withdrawn_with(extra: &[u8], is_ebgp: bool) -> (bool, Vec<Message>) {
+        let mut attrs = base_attrs();
+        attrs.extend_from_slice(extra);
+        let buf = raw_update(&[], &attrs, &[0x08, 0x0a]);
+        let msgs = validate(&mut ipv4_codec(), &buf, is_ebgp).expect("no session reset");
+        assert_eq!(msgs.len(), 1);
+        (is_unreach(&msgs[0], Family::IPV4), msgs)
+    }
+
+    fn reach_attrs(msgs: &[Message]) -> Arc<Vec<Attribute>> {
+        match &msgs[0] {
+            Message::Update(Update::Reach { attr, .. }) => attr.clone(),
+            _ => panic!("expected Reach"),
+        }
+    }
+
+    #[test]
+    fn rfc7606_treat_as_withdraw_attributes() {
+        for (name, extra) in [
+            ("MED length 3 (§7.4)", &[0x80, 0x04, 0x03, 0, 0, 1][..]),
+            (
+                "LOCAL_PREF length 3 (§7.5)",
+                &[0x40, 0x05, 0x03, 0, 0, 1][..],
+            ),
+            (
+                "ORIGINATOR_ID length 3 (§7.9)",
+                &[0x80, 0x09, 0x03, 0, 0, 1][..],
+            ),
+            (
+                "CLUSTER_LIST length 3 (§7.10)",
+                &[0x80, 0x0a, 0x03, 0, 0, 1][..],
+            ),
+            (
+                "COMMUNITY length 3 (§7.8)",
+                &[0xc0, 0x08, 0x03, 0, 0, 1][..],
+            ),
+            (
+                "EXT_COMMUNITY length 7 (§7.14)",
+                &[0xc0, 0x10, 0x07, 0, 0, 0, 0, 0, 0, 1][..],
+            ),
+            (
+                "LARGE_COMMUNITY length 4 (RFC 8092)",
+                &[0xc0, 0x20, 0x04, 0, 0, 0, 1][..],
+            ),
+            // §3 (c): flag conflicts, also on attributes whose malformed
+            // contents would only be discarded.
+            (
+                "AGGREGATOR well-known flags",
+                &[0x40, 0x07, 0x08, 0, 0, 0, 1, 192, 0, 2, 1][..],
+            ),
+            ("ATOMIC_AGGREGATE optional flags", &[0xc0, 0x06, 0x00][..]),
+            ("MED transitive flags", &[0xc0, 0x04, 0x04, 0, 0, 0, 1][..]),
+        ] {
+            let (withdrawn, _) = withdrawn_with(extra, false);
+            assert!(withdrawn, "{name}: expected treat-as-withdraw");
+        }
+    }
+
+    #[test]
+    fn rfc7606_attribute_discard_attributes() {
+        for (name, code, extra, is_ebgp) in [
+            (
+                "ATOMIC_AGGREGATE length 1 (§7.6)",
+                Attribute::ATOMIC_AGGREGATE,
+                &[0x40, 0x06, 0x01, 0][..],
+                false,
+            ),
+            (
+                "AGGREGATOR length 3 (§7.7)",
+                Attribute::AGGREGATOR,
+                &[0xc0, 0x07, 0x03, 0, 1, 0][..],
+                false,
+            ),
+            (
+                "eBGP LOCAL_PREF length 3 (§7.5)",
+                Attribute::LOCAL_PREF,
+                &[0x40, 0x05, 0x03, 0, 0, 1][..],
+                true,
+            ),
+            (
+                "eBGP LOCAL_PREF bad flags (§7.5)",
+                Attribute::LOCAL_PREF,
+                &[0x80, 0x05, 0x04, 0, 0, 0, 1][..],
+                true,
+            ),
+            (
+                "eBGP ORIGINATOR_ID length 3 (§7.9)",
+                Attribute::ORIGINATOR_ID,
+                &[0x80, 0x09, 0x03, 0, 0, 1][..],
+                true,
+            ),
+            (
+                "eBGP CLUSTER_LIST length 3 (§7.10)",
+                Attribute::CLUSTER_LIST,
+                &[0x80, 0x0a, 0x03, 0, 0, 1][..],
+                true,
+            ),
+        ] {
+            let (withdrawn, msgs) = withdrawn_with(extra, is_ebgp);
+            assert!(!withdrawn, "{name}: expected attribute discard");
+            assert!(
+                reach_attrs(&msgs).iter().all(|a| a.code() != code),
+                "{name}: attribute must be discarded"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_nexthop_without_nlri_field_is_ignored() {
+        // RFC 4760 §3: NEXT_HOP is ignored when only MP_REACH_NLRI carries
+        // NLRI, so a malformed one is discarded.
+        let mut attrs = vec![0x40, 0x01, 0x01, 0x00, 0x40, 0x02, 0x00];
+        attrs.extend_from_slice(&[0x40, 0x03, 0x02, 0, 0]);
+        attrs.extend_from_slice(&mp_reach_attr(0x80, Family::IPV6, &V6_NEXTHOP, &V6_NLRI));
+        let buf = raw_update(&[], &attrs, &[]);
+        let msgs = validate(&mut ipv6_codec(), &buf, false).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
     }
 
     #[test]
