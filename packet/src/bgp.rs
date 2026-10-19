@@ -2250,6 +2250,14 @@ fn validate_update(update: ParsedUpdate, is_ebgp: bool) -> Result<Vec<Message>, 
                     !optional || transitive
                 });
 
+            // RFC 7606 §5.2: when an UPDATE carries no reachable NLRI we
+            // cannot be sure every NLRI was located (an attribute framing
+            // error may hide an MP_REACH_NLRI), so any error stronger than
+            // attribute discard requires a session reset.
+            if treat_as_withdraw && reach.is_none() && mp_reach.is_none() {
+                return Err(Notification::UpdateMalformedAttributeList);
+            }
+
             if treat_as_withdraw {
                 let mut msgs: Vec<Message> = Vec::new();
                 // Convert announced NLRIs to withdrawals.
@@ -3026,6 +3034,7 @@ impl PeerCodec {
                     if attr_end < c.position() + 2 {
                         break;
                     }
+                    let attr_start = c.position() as usize;
                     let flags = c.read_u8().map_err(|_| malformed())?;
                     let code = c.read_u8().map_err(|_| malformed())?;
                     let alen = if flags & Attribute::FLAG_EXTENDED != 0 {
@@ -3055,6 +3064,16 @@ impl PeerCodec {
                                 & (Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL)
                                 > 0
                             {
+                                if code == Attribute::MP_REACH || code == Attribute::MP_UNREACH {
+                                    // RFC 7606 §5.3: an MP attribute whose flags
+                                    // conflict with RFC 4760 is incorrect, so its
+                                    // NLRI cannot be used for treat-as-withdraw
+                                    // and §3 (j) requires a session reset.
+                                    let end = c.position() as usize + alen as usize;
+                                    return Err(Notification::UpdateAttributeFlagsError {
+                                        data: buf[attr_start..end].to_vec(),
+                                    });
+                                }
                                 c.set_position(c.position() + alen as u64);
                                 error_attrs.push(AttributeError {
                                     attr_code: code,
@@ -7278,6 +7297,157 @@ mod update_tests {
             _ => panic!("expected Reach message"),
         };
         assert!(attr.iter().all(|a| a.code() != 201));
+    }
+
+    // RFC 7606 helpers: build an UPDATE from its three variable fields.
+    fn raw_update(withdrawn: &[u8], attrs: &[u8], nlri: &[u8]) -> Vec<u8> {
+        let total = 19 + 2 + withdrawn.len() + 2 + attrs.len() + nlri.len();
+        let mut buf = vec![0xffu8; 16];
+        buf.extend_from_slice(&(total as u16).to_be_bytes());
+        buf.push(2);
+        buf.extend_from_slice(&(withdrawn.len() as u16).to_be_bytes());
+        buf.extend_from_slice(withdrawn);
+        buf.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+        buf.extend_from_slice(attrs);
+        buf.extend_from_slice(nlri);
+        buf
+    }
+
+    fn mp_reach_attr(flags: u8, family: Family, nexthop: &[u8], nlri: &[u8]) -> Vec<u8> {
+        let mut v = vec![
+            flags,
+            Attribute::MP_REACH,
+            (5 + nexthop.len() + nlri.len()) as u8,
+        ];
+        v.extend_from_slice(&family.afi().to_be_bytes());
+        v.push(family.safi());
+        v.push(nexthop.len() as u8);
+        v.extend_from_slice(nexthop);
+        v.push(0);
+        v.extend_from_slice(nlri);
+        v
+    }
+
+    fn mp_unreach_attr(flags: u8, family: Family, nlri: &[u8]) -> Vec<u8> {
+        let mut v = vec![flags, Attribute::MP_UNREACH, (3 + nlri.len()) as u8];
+        v.extend_from_slice(&family.afi().to_be_bytes());
+        v.push(family.safi());
+        v.extend_from_slice(nlri);
+        v
+    }
+
+    /// ORIGIN IGP, AS_PATH [65002], NEXT_HOP 192.0.2.1.
+    fn base_attrs() -> Vec<u8> {
+        let mut v = vec![0x40, 0x01, 0x01, 0x00];
+        v.extend_from_slice(&base_attrs_without_origin());
+        v
+    }
+
+    const V6_NEXTHOP: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    /// 2001:db8::/32
+    const V6_NLRI: [u8; 5] = [0x20, 0x20, 0x01, 0x0d, 0xb8];
+
+    fn validate(
+        codec: &mut PeerCodec,
+        buf: &[u8],
+        is_ebgp: bool,
+    ) -> Result<Vec<Message>, Notification> {
+        let parsed = codec.parse_message(buf).expect("parse must not fail");
+        validate_message(parsed, is_ebgp).map(|i| i.collect())
+    }
+
+    fn is_unreach(m: &Message, family: Family) -> bool {
+        matches!(m, Message::Update(Update::Unreach { family: f, .. }) if *f == family)
+    }
+
+    fn dual_codec() -> PeerCodec {
+        let mut c = PeerCodec::new();
+        c.set_family(Family::IPV4, Default::default());
+        c.set_family(Family::IPV6, Default::default());
+        c
+    }
+
+    #[test]
+    fn mp_reach_with_bad_flags_resets_session() {
+        // RFC 7606 §5.3: MP_REACH_NLRI with conflicting flags is incorrect;
+        // §3 (j) then requires a session reset.
+        let mp = mp_reach_attr(0xC0, Family::IPV6, &V6_NEXTHOP, &V6_NLRI);
+        let mut attrs = base_attrs();
+        attrs.extend_from_slice(&mp);
+        let buf = raw_update(&[], &attrs, &[]);
+        match ipv6_codec().parse_message(&buf) {
+            Err(Notification::UpdateAttributeFlagsError { data }) => assert_eq!(data, mp),
+            Err(e) => panic!("expected UpdateAttributeFlagsError, got {e}"),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    #[test]
+    fn mp_unreach_with_bad_flags_resets_session() {
+        let mp = mp_unreach_attr(0x40, Family::IPV6, &V6_NLRI);
+        let buf = raw_update(&[], &mp, &[]);
+        match ipv6_codec().parse_message(&buf) {
+            Err(Notification::UpdateAttributeFlagsError { data }) => assert_eq!(data, mp),
+            Err(e) => panic!("expected UpdateAttributeFlagsError, got {e}"),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    /// MULTI_EXIT_DISC whose length runs past the end of the attributes.
+    const MED_OVERRUN: [u8; 4] = [0x80, 0x04, 0x40, 0x00];
+
+    #[test]
+    fn framing_error_without_reachable_nlri_resets_session() {
+        // RFC 7606 §5.2: the overrun could hide an MP_REACH_NLRI, so the
+        // NLRI cannot be located and treat-as-withdraw is not possible.
+        let mut attrs = mp_unreach_attr(0x80, Family::IPV6, &V6_NLRI);
+        attrs.extend_from_slice(&base_attrs());
+        attrs.extend_from_slice(&MED_OVERRUN);
+        let buf = raw_update(&[], &attrs, &[]);
+        match validate(&mut ipv6_codec(), &buf, false) {
+            Err(Notification::UpdateMalformedAttributeList) => {}
+            r => panic!(
+                "expected UpdateMalformedAttributeList, got {:?}",
+                r.map(|m| m.len())
+            ),
+        }
+    }
+
+    #[test]
+    fn framing_error_after_mp_reach_withdraws_mp_nlri() {
+        // RFC 7606 §4: the MP_REACH_NLRI located before the overrun is
+        // treated as withdrawn.
+        let mut attrs = mp_reach_attr(0x80, Family::IPV6, &V6_NEXTHOP, &V6_NLRI);
+        attrs.extend_from_slice(&base_attrs());
+        attrs.extend_from_slice(&MED_OVERRUN);
+        let buf = raw_update(&[], &attrs, &[]);
+        let msgs = validate(&mut ipv6_codec(), &buf, false).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(is_unreach(&msgs[0], Family::IPV6));
+    }
+
+    #[test]
+    fn framing_error_with_legacy_nlri_withdraws_legacy_and_mp_unreach() {
+        let mut attrs = mp_unreach_attr(0x80, Family::IPV6, &V6_NLRI);
+        attrs.extend_from_slice(&base_attrs());
+        attrs.extend_from_slice(&MED_OVERRUN);
+        let buf = raw_update(&[], &attrs, &[0x08, 0x0a]);
+        let msgs = validate(&mut dual_codec(), &buf, false).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(is_unreach(&msgs[0], Family::IPV4));
+        assert!(is_unreach(&msgs[1], Family::IPV6));
+    }
+
+    #[test]
+    fn attribute_error_in_withdraw_only_update_resets_session() {
+        // RFC 7606 §5.2: path attributes but no reachable NLRI.
+        let mut attrs = base_attrs();
+        attrs.extend_from_slice(&[0xC0, 0x08, 0x03, 0, 0, 1]);
+        let buf = raw_update(&[0x08, 0x0a], &attrs, &[]);
+        assert!(matches!(
+            validate(&mut ipv4_codec(), &buf, false),
+            Err(Notification::UpdateMalformedAttributeList)
+        ));
     }
 }
 
