@@ -281,13 +281,6 @@ impl RibEntry {
             self.flags &= !RibEntry::FLAG_NEXTHOP_INVALID;
         }
     }
-
-    /// True if this entry is in the LLGR stale period: either the source was
-    /// marked LLGR stale by the helper, or the received attributes carry the
-    /// LLGR_STALE community (0xFFFF0006) propagated from another helper.
-    fn is_llgr_stale(&self) -> bool {
-        self.path.source.is_llgr_stale() || has_llgr_stale_community(&self.path.attr)
-    }
 }
 
 /// Process-wide route-selection options. Like GoBGP's
@@ -1844,7 +1837,12 @@ impl Table {
     }
 
     /// Remove LLGR stale routes for `addr` in `family` when the LLGR stale
-    /// timer expires. Mirrors `drop_stale()` but checks `is_llgr_stale()`.
+    /// timer expires or EOR arrives after a reconnect. Mirrors `drop_stale()`
+    /// but checks the source's LLGR stale flag.
+    ///
+    /// Only the source flag counts: a fresh route from the reconnected peer
+    /// may itself carry the LLGR_STALE community (relayed from further away)
+    /// and must survive the cleanup of the previous session's routes.
     pub fn drop_llgr_stale(
         &mut self,
         addr: IpAddr,
@@ -1859,7 +1857,7 @@ impl Table {
                 if !dst
                     .entry
                     .iter()
-                    .any(|e| e.path.source.remote_addr == addr && e.is_llgr_stale())
+                    .any(|e| e.path.source.remote_addr == addr && e.path.source.is_llgr_stale())
                 {
                     return true;
                 }
@@ -1867,21 +1865,22 @@ impl Table {
                 let old_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
                 let removed_any_unfiltered = dst.entry.iter().any(|e| {
                     e.path.source.remote_addr == addr
-                        && e.is_llgr_stale()
+                        && e.path.source.is_llgr_stale()
                         && !e.is_filtered()
                         && !e.is_nexthop_invalid()
                 });
 
                 for e in dst.entry.iter() {
                     if e.path.source.remote_addr == addr
-                        && e.is_llgr_stale()
+                        && e.path.source.is_llgr_stale()
                         && let Some(nh) = e.path.nexthop
                     {
                         removed_nexthops.push(nh.addr());
                     }
                 }
-                dst.entry
-                    .retain(|e| !(e.path.source.remote_addr == addr && e.is_llgr_stale()));
+                dst.entry.retain(|e| {
+                    !(e.path.source.remote_addr == addr && e.path.source.is_llgr_stale())
+                });
 
                 let peer_still_has_path =
                     dst.entry.iter().any(|p| p.path.source.remote_addr == addr);
@@ -6631,6 +6630,26 @@ mod tests {
         let best = flat_best(&rt, &Family::IPV4);
         assert_eq!(best.len(), 1);
         assert_eq!(best[0].1.source.remote_addr, s2.remote_addr);
+    }
+
+    #[test]
+    fn drop_llgr_stale_keeps_fresh_routes_with_llgr_stale_community() {
+        // After a reconnect the peer's fresh source isn't LLGR stale, even if
+        // the route it sent carries LLGR_STALE; only the old source's routes go.
+        let mut rt = Table::new(0);
+        let old_net = nlri(10, 0, 0, 0, 24);
+        let fresh_net = nlri(10, 0, 1, 0, 24);
+        let old = source(1, 65001, 65000, 1);
+        insert_with_attrs(&mut rt, &old, &old_net, attrs_with_origin(0));
+        old.mark_llgr_stale();
+        let fresh = source(1, 65001, 65000, 1);
+        insert_with_attrs(&mut rt, &fresh, &fresh_net, attrs_with_llgr_stale());
+
+        rt.drop_llgr_stale(old.remote_addr, Family::IPV4, None);
+
+        let best = flat_best(&rt, &Family::IPV4);
+        assert_eq!(best.len(), 1);
+        assert!(Arc::ptr_eq(&best[0].1.source, &fresh));
     }
 
     #[test]

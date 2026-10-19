@@ -40,11 +40,13 @@
 //!
 //!   PeerRestarting  (remote peer has restarted; we are the helper)
 //!     + SessionEstablished(gr_families)
+//!         dropped = (stale_families + LLGR families) - gr_families
 //!         output: [StopTimer, DeleteStaleRoutes(dropped)?]
 //!         if gr_families empty: --> Idle
 //!         else:                 --> PeerReconnected { pending, from_llgr: false }
 //!     + TimerExpired, llgr: Some(lp)
-//!         output: [StartLlgrTimers(lp.families)]  (driver also marks source LLGR stale,
+//!         output: [DeleteStaleRoutes(stale_families - lp.families)?,
+//!                  StartLlgrTimers(lp.families)]  (driver also marks source LLGR stale,
 //!                                                   deletes NO_LLGR routes)
 //!         --> LlgrStaling { remaining: lp.families.keys }
 //!     + TimerExpired, llgr: None
@@ -54,7 +56,7 @@
 //!
 //!   LlgrStaling  (GR timer expired; LLGR stale period running per family)
 //!     + SessionEstablished(gr_families)
-//!         output: [StopLlgrTimers]
+//!         output: [StopLlgrTimers, DeleteLlgrStaleRoutes(remaining - gr_families)?]
 //!         if gr_families empty: --> Idle
 //!         else:                 --> PeerReconnected { pending, from_llgr: true }
 //!     + LlgrTimerExpired(family)
@@ -208,13 +210,26 @@ impl GrState {
 
             // GR timer expired with LLGR configured: transition to LLGR stale period.
             // The driver is responsible for marking the source LLGR stale and deleting
-            // NO_LLGR routes when it sees StartLlgrTimers.
-            (Inner::PeerRestarting { llgr: Some(lp), .. }, GrInput::TimerExpired) => {
-                let remaining = lp.families.iter().map(|(f, _)| *f).collect();
-                (
-                    Inner::LlgrStaling { remaining },
-                    vec![GrOutput::StartLlgrTimers(lp.families)],
-                )
+            // NO_LLGR routes when it sees StartLlgrTimers.  GR families that LLGR
+            // doesn't cover have no further retention period: delete them now.
+            (
+                Inner::PeerRestarting {
+                    stale_families,
+                    llgr: Some(lp),
+                },
+                GrInput::TimerExpired,
+            ) => {
+                let remaining: FnvHashSet<Family> = lp.families.iter().map(|(f, _)| *f).collect();
+                let gr_only: Vec<Family> = stale_families
+                    .into_iter()
+                    .filter(|f| !remaining.contains(f))
+                    .collect();
+                let mut outputs = vec![];
+                if !gr_only.is_empty() {
+                    outputs.push(GrOutput::DeleteStaleRoutes(gr_only));
+                }
+                outputs.push(GrOutput::StartLlgrTimers(lp.families));
+                (Inner::LlgrStaling { remaining }, outputs)
             }
 
             // GR timer expired without LLGR: delete stale routes and return to Idle.
@@ -231,11 +246,22 @@ impl GrState {
 
             // Peer reconnected while GR restart timer was running.
             (
-                Inner::PeerRestarting { stale_families, .. },
+                Inner::PeerRestarting {
+                    stale_families,
+                    llgr,
+                },
                 GrInput::SessionEstablished { gr_families },
             ) => {
                 let gr_set: FnvHashSet<Family> = gr_families.into_iter().collect();
-                let dropped: Vec<Family> = stale_families
+                // LLGR-only families were retained (and marked stale) at session
+                // drop too, so they need the same cleanup as GR families.
+                let mut retained: Vec<Family> = stale_families;
+                for (f, _) in llgr.iter().flat_map(|lp| lp.families.iter()) {
+                    if !retained.contains(f) {
+                        retained.push(*f);
+                    }
+                }
+                let dropped: Vec<Family> = retained
                     .into_iter()
                     .filter(|f| !gr_set.contains(f))
                     .collect();
@@ -259,6 +285,12 @@ impl GrState {
             // Peer reconnected during LLGR stale period.
             (Inner::LlgrStaling { remaining }, GrInput::SessionEstablished { gr_families }) => {
                 let gr_set: FnvHashSet<Family> = gr_families.into_iter().collect();
+                // Families the new session doesn't cover with GR get no EOR wait,
+                // so their LLGR stale routes are dropped immediately.
+                let dropped: Vec<Family> = remaining
+                    .into_iter()
+                    .filter(|f| !gr_set.contains(f))
+                    .collect();
                 let new_state = if gr_set.is_empty() {
                     Inner::Idle
                 } else {
@@ -268,12 +300,8 @@ impl GrState {
                     }
                 };
                 let mut outputs = vec![GrOutput::StopLlgrTimers];
-                // Peer reconnected without GR: no EOR mechanism to trigger cleanup,
-                // so drop remaining LLGR stale routes immediately.
-                if matches!(new_state, Inner::Idle) && !remaining.is_empty() {
-                    outputs.push(GrOutput::DeleteLlgrStaleRoutes(
-                        remaining.into_iter().collect(),
-                    ));
+                if !dropped.is_empty() {
+                    outputs.push(GrOutput::DeleteLlgrStaleRoutes(dropped));
                 }
                 (new_state, outputs)
             }
@@ -876,6 +904,72 @@ mod tests {
     }
 
     #[test]
+    fn gr_timer_expiry_deletes_gr_only_families_when_llgr_takes_over() {
+        // GR covers IPv4 and IPv6, LLGR only IPv4: IPv6 has no retention
+        // period left once the restart timer fires.
+        let mut gr = GrState::new();
+        gr.process(GrInput::SessionDropped {
+            gr: Some(GrParams {
+                families: vec![ipv4(), ipv6()],
+                restart_time: restart_time(),
+            }),
+            llgr: Some(LlgrParams {
+                families: vec![(ipv4(), llgr_time())],
+            }),
+        });
+
+        let outputs = gr.process(GrInput::TimerExpired);
+
+        assert_eq!(outputs.len(), 2);
+        assert!(matches!(&outputs[0], GrOutput::DeleteStaleRoutes(f) if f == &[ipv6()]));
+        assert!(
+            matches!(&outputs[1], GrOutput::StartLlgrTimers(v) if v == &[(ipv4(), llgr_time())])
+        );
+        assert!(matches!(gr.state, Inner::LlgrStaling { .. }));
+    }
+
+    #[test]
+    fn reconnect_during_gr_drops_llgr_only_families_not_renegotiated() {
+        // GR covers IPv4, LLGR covers IPv6; the peer comes back with GR for
+        // IPv4 only, so IPv6's retained routes must go now.
+        let mut gr = GrState::new();
+        gr.process(GrInput::SessionDropped {
+            gr: Some(GrParams {
+                families: vec![ipv4()],
+                restart_time: restart_time(),
+            }),
+            llgr: Some(LlgrParams {
+                families: vec![(ipv6(), llgr_time())],
+            }),
+        });
+
+        let outputs = establish(&mut gr, vec![ipv4()]);
+
+        assert_eq!(outputs.len(), 2);
+        assert!(matches!(outputs[0], GrOutput::StopTimer));
+        assert!(matches!(&outputs[1], GrOutput::DeleteStaleRoutes(f) if f == &[ipv6()]));
+    }
+
+    #[test]
+    fn reconnect_during_llgr_drops_families_not_renegotiated() {
+        let mut gr = GrState::new();
+        drop_llgr_only(&mut gr, vec![ipv4(), ipv6()]);
+
+        let outputs = establish(&mut gr, vec![ipv4()]);
+
+        assert_eq!(outputs.len(), 2);
+        assert!(matches!(outputs[0], GrOutput::StopLlgrTimers));
+        assert!(matches!(&outputs[1], GrOutput::DeleteLlgrStaleRoutes(f) if f == &[ipv6()]));
+        assert!(matches!(
+            gr.state,
+            Inner::PeerReconnected {
+                from_llgr: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn llgr_timer_expiry_deletes_llgr_stale_routes() {
         let mut gr = GrState::new();
         drop_gr_llgr(&mut gr, vec![ipv4()]);
@@ -1034,10 +1128,12 @@ mod tests {
         assert!(matches!(gr.state, Inner::PeerRestarting { .. }));
 
         // Verify the new LLGR params survive by checking timer expiry output.
+        // IPv6 is GR-only in the new params, so it is deleted at expiry.
         let outputs = gr.process(GrInput::TimerExpired);
-        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs.len(), 2);
+        assert!(matches!(&outputs[0], GrOutput::DeleteStaleRoutes(f) if f == &[ipv6()]));
         assert!(matches!(
-            &outputs[0],
+            &outputs[1],
             GrOutput::StartLlgrTimers(v) if v == &[(ipv4(), Duration::from_secs(7200))]
         ));
         assert!(matches!(gr.state, Inner::LlgrStaling { .. }));

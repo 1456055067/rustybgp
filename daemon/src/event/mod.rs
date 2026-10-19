@@ -3905,10 +3905,14 @@ impl PeerSession {
                 negotiated_gr.as_ref(),
                 negotiated_llgr.as_ref(),
             );
-            let stale_families: Vec<Family> = negotiated_gr
-                .as_ref()
-                .map(|g| g.families.clone())
-                .unwrap_or_default();
+            // Every retained family is marked stale, LLGR-only ones included,
+            // so EOR or a reconnect can tell the old routes from fresh ones.
+            let stale_families: Vec<Family> = self
+                .source
+                .keys()
+                .filter(|f| !drop_families.contains(f))
+                .copied()
+                .collect();
             // All per-family Sources share the same peer-level fields; use any for BMP.
             let any_source = self.source.values().next().unwrap().clone();
             let bmp_reason = crate::bmp::session_down_to_bmp(shutdown_reason.clone());
