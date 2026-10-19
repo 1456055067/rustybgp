@@ -1043,11 +1043,21 @@ impl Table {
     /// callers treating it as a fresh event (initial dump, route refresh) will
     /// unconditionally advertise every prefix.
     fn collect_loc_rib_paths_impl(&self, family: &Family, max_paths: usize) -> Vec<NlriChange> {
+        self.collect_loc_rib_paths_matching(family, max_paths, |_| true)
+    }
+
+    fn collect_loc_rib_paths_matching(
+        &self,
+        family: &Family,
+        max_paths: usize,
+        pred: impl Fn(&packet::Nlri) -> bool,
+    ) -> Vec<NlriChange> {
         let Some(t) = self.ribs.get(family) else {
             return Vec::new();
         };
         t.destinations
             .iter()
+            .filter(|(net, _)| pred(net))
             .filter_map(|(net, dst)| {
                 let paths: Vec<Path> = dst
                     .unfiltered_iter()
@@ -1072,6 +1082,52 @@ impl Table {
 
     pub fn collect_loc_rib_paths(&self, family: &Family) -> Vec<NlriChange> {
         self.collect_loc_rib_paths_impl(family, usize::MAX)
+    }
+
+    /// Non-stale Adj-RIB-In paths of IPv4/IPv6 unicast routes covered by a
+    /// prefix in `changes`, i.e. the routes whose RPKI validation state may
+    /// have changed and whose import policy must be re-run (RFC 8481
+    /// section 4).
+    pub fn collect_rpki_affected_paths(&self, changes: &RoaChanges) -> Vec<SoftResetPath> {
+        let mut out = Vec::new();
+        for family in [Family::IPV4, Family::IPV6] {
+            let Some(rib) = self.ribs.get(&family) else {
+                continue;
+            };
+            for (net, dst) in &rib.destinations {
+                if !changes.covers(net) {
+                    continue;
+                }
+                for entry in &dst.entry {
+                    if entry.path.source.is_stale() {
+                        continue;
+                    }
+                    out.push((
+                        family,
+                        net.clone(),
+                        entry.remote_path_id,
+                        entry.path.nexthop,
+                        Arc::clone(&entry.path.source),
+                        Arc::clone(&entry.original_attr),
+                        entry.timestamp,
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Loc-RIB state of the destinations covered by a prefix in `changes`,
+    /// for re-running export policy after an RPKI change (RFC 8481
+    /// section 4).
+    pub fn collect_rpki_affected_dests(&self, changes: &RoaChanges) -> Vec<NlriChange> {
+        let mut out = Vec::new();
+        for family in [Family::IPV4, Family::IPV6] {
+            out.extend(
+                self.collect_loc_rib_paths_matching(&family, usize::MAX, |net| changes.covers(net)),
+            );
+        }
+        out
     }
 
     pub fn collect_loc_rib_paths_limited(
@@ -2235,6 +2291,64 @@ impl Roa {
     }
 }
 
+/// The ROA prefixes whose set of ROAs changed. A route's RPKI validation
+/// state can only change if one of these prefixes covers it (RFC 6811
+/// section 2), so only those routes need re-validation (RFC 8481 section 4).
+#[derive(Default)]
+pub struct RoaChanges {
+    keys: FnvHashMap<Family, HashSet<Vec<u8>>>,
+    /// Distinct prefix lengths in `keys`, per family.
+    lens: FnvHashMap<Family, Vec<u8>>,
+}
+
+impl RoaChanges {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, net: &packet::IpNet) {
+        let (family, addr, mask) = match net {
+            packet::IpNet::V4(n) => (Family::IPV4, n.addr.octets().to_vec(), n.mask),
+            packet::IpNet::V6(n) => (Family::IPV6, n.addr.octets().to_vec(), n.mask),
+        };
+        if self
+            .keys
+            .entry(family)
+            .or_default()
+            .insert(RpkiTable::prefix_key(addr, mask))
+        {
+            let lens = self.lens.entry(family).or_default();
+            if let Err(i) = lens.binary_search(&mask) {
+                lens.insert(i, mask);
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.values().all(|k| k.is_empty())
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.values().map(|k| k.len()).sum()
+    }
+
+    /// True if a changed prefix covers `net`: it is no longer than `net`
+    /// and `net` falls within it.
+    pub fn covers(&self, net: &packet::Nlri) -> bool {
+        let (family, addr, mask) = match net {
+            packet::Nlri::V4(n) => (Family::IPV4, n.addr.octets().to_vec(), n.mask),
+            packet::Nlri::V6(n) => (Family::IPV6, n.addr.octets().to_vec(), n.mask),
+            _ => return false,
+        };
+        let (Some(keys), Some(lens)) = (self.keys.get(&family), self.lens.get(&family)) else {
+            return false;
+        };
+        lens.iter()
+            .take_while(|&&len| len <= mask)
+            .any(|&len| keys.contains(&RpkiTable::prefix_key(addr.clone(), len)))
+    }
+}
+
 #[derive(Default)]
 pub struct RpkiTableState {
     pub num_records_v4: u32,
@@ -2432,17 +2546,17 @@ impl RpkiTable {
         }
     }
 
-    pub fn drop_source(&mut self, source: Arc<IpAddr>) {
+    /// Removes every ROA learned from `source` and returns the prefixes
+    /// that lost a ROA.
+    pub fn drop_source(&mut self, source: Arc<IpAddr>) -> RoaChanges {
+        let mut changes = RoaChanges::new();
         for roa in self.roas.values_mut() {
             let mut empty = Vec::new();
             for (n, e) in roa.iter_mut() {
-                let mut i = 0;
-                while i != e.len() {
-                    if Arc::ptr_eq(&e[i].source, &source) {
-                        e.remove(i);
-                    } else {
-                        i += 1;
-                    }
+                let before = e.len();
+                e.retain(|r| !Arc::ptr_eq(&r.source, &source));
+                if e.len() != before {
+                    changes.add(&RpkiTable::key_to_addr(n.clone()));
                 }
                 if e.is_empty() {
                     empty.push(n);
@@ -2452,6 +2566,7 @@ impl RpkiTable {
                 roa.remove(n);
             }
         }
+        changes
     }
 
     pub fn state(&self, addr: &IpAddr) -> RpkiTableState {
@@ -6923,6 +7038,84 @@ mod tests {
         assert!(validate(&t, "10.0.32.0/22", origin_seq(65001)) == RpkiValidationState::NotFound);
         // A less-specific route is not covered by the /20.
         assert!(validate(&t, "10.0.0.0/19", origin_seq(65001)) == RpkiValidationState::NotFound);
+    }
+
+    fn ipnet(prefix: &str) -> packet::IpNet {
+        let (addr, len) = prefix.split_once('/').unwrap();
+        packet::IpNet::new(addr.parse().unwrap(), len.parse().unwrap())
+    }
+
+    #[test]
+    fn roa_changes_covers() {
+        let mut c = RoaChanges::new();
+        assert!(c.is_empty());
+        assert!(!c.covers(&route("10.0.0.0/24")));
+        c.add(&ipnet("10.0.0.0/16"));
+        c.add(&ipnet("10.0.0.0/16"));
+        c.add(&ipnet("2001:db8::/32"));
+        assert_eq!(c.len(), 2);
+        // Equal and more specific routes are covered.
+        assert!(c.covers(&route("10.0.0.0/16")));
+        assert!(c.covers(&route("10.0.5.0/24")));
+        assert!(c.covers(&route("10.0.255.128/25")));
+        // Less specific, sibling and other-family routes are not.
+        assert!(!c.covers(&route("10.0.0.0/8")));
+        assert!(!c.covers(&route("10.1.0.0/24")));
+        assert!(!c.covers(&route("192.0.2.0/24")));
+        assert!(c.covers(&route("2001:db8:1::/48")));
+        assert!(!c.covers(&route("2001:db9::/48")));
+        // Host bits in the ROA prefix are ignored.
+        let mut c = RoaChanges::new();
+        c.add(&ipnet("10.0.1.7/24"));
+        assert!(c.covers(&route("10.0.1.0/25")));
+    }
+
+    #[test]
+    fn rpki_affected_paths_and_dests() {
+        let mut rt = Table::new(0);
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65002, 65000, 2);
+        for p in ["10.0.1.0/24", "10.0.2.0/24", "10.1.0.0/24", "10.0.0.0/8"] {
+            insert_path(&mut rt, &s1, &route(p));
+        }
+        insert_path(&mut rt, &s2, &route("10.0.1.0/24"));
+
+        let mut c = RoaChanges::new();
+        c.add(&ipnet("10.0.0.0/16"));
+
+        let mut paths: Vec<(String, IpAddr)> = rt
+            .collect_rpki_affected_paths(&c)
+            .into_iter()
+            .map(|(_, net, _, _, src, _, _)| (net.to_string(), src.remote_addr))
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                ("10.0.1.0/24".to_string(), s1.remote_addr),
+                ("10.0.1.0/24".to_string(), s2.remote_addr),
+                ("10.0.2.0/24".to_string(), s1.remote_addr),
+            ]
+        );
+
+        let mut dests: Vec<String> = rt
+            .collect_rpki_affected_dests(&c)
+            .into_iter()
+            .map(|d| {
+                assert!(d.best_changed && d.any_changed);
+                d.net.to_string()
+            })
+            .collect();
+        dests.sort();
+        assert_eq!(dests, vec!["10.0.1.0/24", "10.0.2.0/24"]);
+
+        // Stale paths are left alone.
+        s2.mark_stale();
+        assert_eq!(rt.collect_rpki_affected_paths(&c).len(), 2);
+        assert!(
+            rt.collect_rpki_affected_paths(&RoaChanges::new())
+                .is_empty()
+        );
     }
 
     #[test]

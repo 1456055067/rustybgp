@@ -180,22 +180,19 @@ impl RpkiClient {
                             ));
                             if prefix.flags & 1 > 0 {
                                 if end_of_data {
-                                    tables
-                                        .rpki_insert(vec![(prefix.net.clone(), roa)])
-                                        ;
+                                    tables.rpki_apply(vec![(prefix.net.clone(), roa)], vec![]);
                                 } else {
                                     v.push((prefix.net, roa));
                                 }
                             } else if end_of_data {
-                                tables
-                                    .rpki_withdraw(vec![(prefix.net.clone(), roa)])
-                                    ;
+                                tables.rpki_apply(vec![], vec![(prefix.net.clone(), roa)]);
                             }
                         }
                         rpki::Message::EndOfData { serial_number, .. } => {
                             end_of_data = true;
                             state.serial.store(serial_number, Ordering::Relaxed);
-                            tables.rpki_reset(remote_addr.clone(), v.to_owned());
+                            tables.rpki_drop_all(remote_addr.clone());
+                            tables.rpki_apply(v.to_owned(), vec![]);
                         }
                         _ => {}
                     }

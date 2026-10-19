@@ -566,34 +566,72 @@ impl TableManager {
         }
     }
 
-    pub(crate) fn rpki_insert(&self, roas: Vec<(packet::IpNet, Arc<table::Roa>)>) {
-        let mut rpki = self.rpki.write().unwrap();
-        for (net, roa) in roas {
-            rpki.insert(net, roa);
-        }
-    }
-
-    pub(crate) fn rpki_withdraw(&self, roas: Vec<(packet::IpNet, Arc<table::Roa>)>) {
-        let mut rpki = self.rpki.write().unwrap();
-        for (net, roa) in roas {
-            rpki.remove(net, &roa);
-        }
-    }
-
-    pub(crate) fn rpki_reset(
+    /// Applies a batch of ROA changes from one cache and re-validates the
+    /// routes they cover (RFC 8481 section 4).
+    pub(crate) fn rpki_apply(
         &self,
-        addr: Arc<IpAddr>,
-        roas: Vec<(packet::IpNet, Arc<table::Roa>)>,
+        announce: Vec<(packet::IpNet, Arc<table::Roa>)>,
+        withdraw: Vec<(packet::IpNet, Arc<table::Roa>)>,
     ) {
-        let mut rpki = self.rpki.write().unwrap();
-        rpki.drop_source(addr);
-        for (net, roa) in roas {
-            rpki.insert(net, roa);
+        let mut changes = table::RoaChanges::new();
+        {
+            let mut rpki = self.rpki.write().unwrap();
+            for (net, roa) in withdraw {
+                changes.add(&net);
+                rpki.remove(net, &roa);
+            }
+            for (net, roa) in announce {
+                changes.add(&net);
+                rpki.insert(net, roa);
+            }
         }
+        self.rpki_revalidate(&changes);
     }
 
+    /// Drops every ROA learned from the cache at `addr` and re-validates the
+    /// routes they covered.
     pub(crate) fn rpki_drop_all(&self, addr: Arc<IpAddr>) {
-        self.rpki.write().unwrap().drop_source(addr);
+        let changes = self.rpki.write().unwrap().drop_source(addr);
+        self.rpki_revalidate(&changes);
+    }
+
+    /// Re-validates the routes covered by `changes` (RFC 8481 section 4):
+    /// re-runs an import policy that uses RPKI conditions on the affected
+    /// Adj-RIB-In paths, then asks peers to re-run their export policy on
+    /// the affected destinations. Routes not covered by a changed prefix
+    /// cannot change validation state and are left alone.
+    pub(crate) fn rpki_revalidate(&self, changes: &table::RoaChanges) {
+        if changes.is_empty() {
+            return;
+        }
+        let rpki = self.rpki.read().unwrap();
+        let import_policy = self.import_policy.load_full().filter(|p| p.needs_rpki);
+        let kernel_handle = self.kernel_handle.load_full();
+        let nht_set = self.nexthop_invalid.load_full();
+        let subs = self.subscribers.load();
+        for shard in &self.shards {
+            let mut t = shard.lock().unwrap();
+            if let Some(policy) = import_policy.as_deref() {
+                let paths = t.rtable.collect_rpki_affected_paths(changes);
+                t.reapply_import(
+                    &subs,
+                    paths,
+                    Some(policy),
+                    Some(&*rpki),
+                    kernel_handle.as_deref(),
+                    &nht_set,
+                );
+            }
+            if t.peer_event_tx.is_empty() {
+                continue;
+            }
+            for update in t.rtable.collect_rpki_affected_dests(changes) {
+                let update = Arc::new(update);
+                for tx in t.peer_event_tx.values() {
+                    let _ = tx.send(ToPeerEvent::RpkiRevalidate(Arc::clone(&update)));
+                }
+            }
+        }
     }
 
     pub(crate) fn table_state(&self, family: Family) -> table::TableState {
@@ -1323,6 +1361,27 @@ impl TableShard {
         nexthop_invalid: &FnvHashSet<IpAddr>,
     ) {
         let paths = self.rtable.collect_adj_in_paths(peer, None, false);
+        self.reapply_import(
+            subs,
+            paths,
+            import_policy,
+            rpki,
+            kernel_handle,
+            nexthop_invalid,
+        );
+    }
+
+    /// Re-applies `import_policy` to `paths` (from their stored pre-policy
+    /// attributes) and re-inserts them, distributing any resulting change.
+    fn reapply_import(
+        &mut self,
+        subs: &[(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)],
+        paths: Vec<table::SoftResetPath>,
+        import_policy: Option<&table::PolicyAssignment>,
+        rpki: Option<&table::RpkiTable>,
+        kernel_handle: Option<&kernel::KernelHandle>,
+        nexthop_invalid: &FnvHashSet<IpAddr>,
+    ) {
         for (family, net, remote_path_id, mut nh, source, original_attr, timestamp) in paths {
             let old_nh =
                 self.rtable
@@ -1694,6 +1753,105 @@ mod tests {
             nhs[0].addr(),
             "192.0.2.1".parse::<std::net::IpAddr>().unwrap()
         );
+    }
+
+    // --- RFC 8481 re-validation ---
+
+    /// Import policy that rejects RPKI-invalid routes.
+    fn reject_invalid_import() -> Arc<table::PolicyAssignment> {
+        let mut ptable = table::PolicyTable::new();
+        ptable
+            .add_statement(
+                "st",
+                vec![table::ConditionConfig::Rpki(
+                    table::RpkiValidationState::Invalid,
+                )],
+                Some(table::Disposition::Reject),
+                table::Actions::default(),
+            )
+            .unwrap();
+        ptable.add_policy("pol", vec!["st".to_string()]).unwrap();
+        let (_, a) = ptable
+            .add_assignment(
+                "global",
+                table::PolicyDirection::Import,
+                table::Disposition::Accept,
+                vec!["pol".to_string()],
+            )
+            .unwrap();
+        a
+    }
+
+    fn roa(
+        prefix: &str,
+        max_length: u8,
+        asn: u32,
+        src: &Arc<IpAddr>,
+    ) -> (packet::IpNet, Arc<table::Roa>) {
+        let (addr, len) = prefix.split_once('/').unwrap();
+        (
+            packet::IpNet::new(addr.parse().unwrap(), len.parse().unwrap()),
+            Arc::new(table::Roa::new(max_length, asn, src.clone())),
+        )
+    }
+
+    fn loc_rib_prefixes(tables: &TableManager) -> Vec<String> {
+        let mut v: Vec<String> = tables
+            .collect_loc_rib_paths(Family::IPV4)
+            .iter()
+            .map(|c| c.net.to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn rpki_change_reapplies_import_policy_to_covered_routes() {
+        let tables = make_tables();
+        tables.import_policy.store(Some(reject_invalid_import()));
+        let cache = Arc::new("192.0.2.1".parse::<IpAddr>().unwrap());
+        // Empty AS_PATH: the origin is the source's local AS, 65001.
+        let src = make_peer_source("10.0.0.2", "127.0.0.1", 65002);
+        insert_v4_route(&tables, src.clone(), "10.0.1.0/24", "10.0.0.2");
+        insert_v4_route(&tables, src, "172.16.0.0/24", "10.0.0.2");
+        assert_eq!(loc_rib_prefixes(&tables), ["10.0.1.0/24", "172.16.0.0/24"]);
+
+        let mut rx =
+            tables.register_peer("10.0.0.9".parse().unwrap(), FnvHashSet::default(), |_| {});
+
+        // A ROA for another AS makes 10.0.1.0/24 Invalid: it is now rejected.
+        tables.rpki_apply(vec![roa("10.0.0.0/16", 24, 65009, &cache)], vec![]);
+        assert_eq!(loc_rib_prefixes(&tables), ["172.16.0.0/24"]);
+
+        // Only the covered destination is offered to peers for export
+        // re-evaluation (after the withdrawal caused by re-import).
+        let mut revalidated = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ToPeerEvent::RpkiRevalidate(c) = ev {
+                revalidated.push(c.net.to_string());
+            }
+        }
+        assert!(revalidated.iter().all(|n| n == "10.0.1.0/24"));
+
+        // A matching ROA makes it Valid again.
+        tables.rpki_apply(vec![roa("10.0.0.0/16", 24, 65001, &cache)], vec![]);
+        assert_eq!(loc_rib_prefixes(&tables), ["10.0.1.0/24", "172.16.0.0/24"]);
+
+        // Withdrawing the matching ROA leaves the other one: Invalid again.
+        tables.rpki_apply(vec![], vec![roa("10.0.0.0/16", 24, 65001, &cache)]);
+        assert_eq!(loc_rib_prefixes(&tables), ["172.16.0.0/24"]);
+
+        // Dropping the cache's data: NotFound, accepted.
+        tables.rpki_drop_all(cache);
+        assert_eq!(loc_rib_prefixes(&tables), ["10.0.1.0/24", "172.16.0.0/24"]);
+        let mut revalidated = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ToPeerEvent::RpkiRevalidate(c) = ev {
+                revalidated.push(c.net.to_string());
+            }
+        }
+        assert!(revalidated.contains(&"10.0.1.0/24".to_string()));
+        assert!(!revalidated.contains(&"172.16.0.0/24".to_string()));
     }
 
     // --- NHT (Nexthop Tracking) tests ---
