@@ -749,6 +749,25 @@ impl Nexthop {
         )
     }
 
+    /// Whether `len` is a valid MP_REACH_NLRI Next Hop length for
+    /// `family`. `extended_nexthop` is true when RFC 8950 was negotiated
+    /// for the family. Families not listed are checked by `from_bytes`.
+    fn len_is_valid(family: Family, len: u8, extended_nexthop: bool) -> bool {
+        match family {
+            // RFC 4760, RFC 8277; RFC 8950 §3 adds an IPv6 next hop.
+            Family::IPV4 | Family::IPV4_MC | Family::IPV4_MPLS => {
+                len == 4 || (extended_nexthop && (len == 16 || len == 32))
+            }
+            // RFC 4364 §4.3.2; RFC 8950 §3: RD + IPv6 address(es).
+            Family::IPV4_VPN => len == 12 || (extended_nexthop && (len == 24 || len == 48)),
+            // RFC 2545 §3, RFC 4798 §2.
+            Family::IPV6 | Family::IPV6_MC | Family::IPV6_MPLS => len == 16 || len == 32,
+            // RFC 4659 §3.2.1.
+            Family::IPV6_VPN => len == 24 || len == 48,
+            _ => true,
+        }
+    }
+
     /// Parse the Next Hop field of `family` (NEXT_HOP attribute value, or
     /// the MP_REACH_NLRI Next Hop field without the length octet).
     ///
@@ -795,9 +814,14 @@ impl Nexthop {
                 let ll: [u8; 16] = b[16..32].try_into().ok()?;
                 let ll_addr = Ipv6Addr::from(ll);
                 if ll_addr.is_unspecified() {
+                    // Some speakers send a zero second address; there is no
+                    // link-local next hop then.
                     Some(Nexthop::V6(Ipv6Addr::from(global)))
-                } else {
+                } else if ll_addr.is_unicast_link_local() {
                     Some(Nexthop::V6LinkLocal(Ipv6Addr::from(global), ll_addr))
+                } else {
+                    // RFC 2545 §3: the second address is link-local.
+                    None
                 }
             }
             _ => None,
@@ -2467,11 +2491,13 @@ impl Message {
     }
 }
 
-/// Per-family negotiated ADD-PATH capability state.
+/// Per-family negotiated ADD-PATH and Extended Next Hop capability state.
 #[derive(Default)]
 pub struct FamilyState {
     pub addpath_rx: bool,
     pub addpath_tx: bool,
+    /// RFC 8950: both sides advertised an IPv6 next hop for this IPv4 family.
+    pub extended_nexthop: bool,
 }
 
 pub struct PeerCodec {
@@ -2552,14 +2578,14 @@ impl PeerCodec {
             if let Some(lc) = lmap.remove(&f) {
                 let addpath_rx = lc.addpath & 0x1 > 0 && rc.addpath & 0x2 > 0;
                 let addpath_tx = lc.addpath & 0x2 > 0 && rc.addpath & 0x1 > 0;
-                if lc.extended_nexthop && rc.extended_nexthop {
-                    extended_nexthop = true;
-                }
+                let family_extended_nexthop = lc.extended_nexthop && rc.extended_nexthop;
+                extended_nexthop |= family_extended_nexthop;
                 families.insert(
                     f,
                     FamilyState {
                         addpath_rx,
                         addpath_tx,
+                        extended_nexthop: family_extended_nexthop,
                     },
                 );
             }
@@ -3323,51 +3349,56 @@ impl PeerCodec {
                     )?;
                 }
 
-                let mp_reach: Option<(Family, Vec<PathNlri>, Option<Nexthop>)> = if let Some(a) =
-                    mp_reach_attr
-                {
-                    let err = Notification::UpdateOptionalAttributeError;
-                    let buf = a.binary().unwrap();
-                    if buf.len() < 5 {
-                        return Err(err);
-                    }
-                    let mut c = Cursor::new(buf);
-                    let afi = c.read_u16::<NetworkEndian>().unwrap();
-                    let safi = c.read_u8().unwrap();
-                    let family = Family((afi as u32) << 16 | safi as u32);
-                    let addpath_rx = self.families.get(&family).ok_or_else(malformed)?.addpath_rx;
-                    let nexthop_len = c.read_u8().unwrap();
-                    if buf.len() < 5 + nexthop_len as usize {
-                        return Err(err);
-                    }
-                    let pos = c.position() as usize;
-                    let nexthop = if Nexthop::is_flowspec_family(family) {
-                        // RFC 8955 Section 4: "The Network Address of the
-                        // Next-Hop field MUST be ignored." Ignore any length,
-                        // like BIRD, so that the nexthop is never stored or
-                        // tracked by NHT.
-                        None
+                let mp_reach: Option<(Family, Vec<PathNlri>, Option<Nexthop>)> =
+                    if let Some(a) = mp_reach_attr {
+                        let err = Notification::UpdateOptionalAttributeError;
+                        let buf = a.binary().unwrap();
+                        if buf.len() < 5 {
+                            return Err(err);
+                        }
+                        let mut c = Cursor::new(buf);
+                        let afi = c.read_u16::<NetworkEndian>().unwrap();
+                        let safi = c.read_u8().unwrap();
+                        let family = Family((afi as u32) << 16 | safi as u32);
+                        let state = self.families.get(&family).ok_or_else(malformed)?;
+                        let addpath_rx = state.addpath_rx;
+                        let nexthop_len = c.read_u8().unwrap();
+                        if buf.len() < 5 + nexthop_len as usize {
+                            return Err(err);
+                        }
+                        // RFC 7606 §7.11: a next hop length that does not match
+                        // the family hides where the NLRI start; reset the session.
+                        if !Nexthop::len_is_valid(family, nexthop_len, state.extended_nexthop) {
+                            return Err(err);
+                        }
+                        let pos = c.position() as usize;
+                        let nexthop = if Nexthop::is_flowspec_family(family) {
+                            // RFC 8955 Section 4: "The Network Address of the
+                            // Next-Hop field MUST be ignored." Ignore any length,
+                            // like BIRD, so that the nexthop is never stored or
+                            // tracked by NHT.
+                            None
+                        } else {
+                            // Any other family with nexthop_len=0 is malformed;
+                            // from_bytes() also rejects a length or RD that does
+                            // not match the family.
+                            Some(
+                                Nexthop::from_bytes(family, &buf[pos..pos + nexthop_len as usize])
+                                    .ok_or(err)?,
+                            )
+                        };
+                        c.set_position(pos as u64 + nexthop_len as u64);
+                        c.read_u8().unwrap();
+                        let entries = Self::decode_nlri_list(
+                            family,
+                            addpath_rx,
+                            true,
+                            &buf[c.position() as usize..],
+                        )?;
+                        Some((family, entries, nexthop))
                     } else {
-                        // Any other family with nexthop_len=0 is malformed;
-                        // from_bytes() also rejects a length or RD that does
-                        // not match the family.
-                        Some(
-                            Nexthop::from_bytes(family, &buf[pos..pos + nexthop_len as usize])
-                                .ok_or(err)?,
-                        )
+                        None
                     };
-                    c.set_position(pos as u64 + nexthop_len as u64);
-                    c.read_u8().unwrap();
-                    let entries = Self::decode_nlri_list(
-                        family,
-                        addpath_rx,
-                        true,
-                        &buf[c.position() as usize..],
-                    )?;
-                    Some((family, entries, nexthop))
-                } else {
-                    None
-                };
 
                 let mp_unreach: Option<(Family, Vec<PathNlri>)> = if let Some(a) = mp_unreach_attr {
                     let err = Notification::UpdateOptionalAttributeError;
@@ -7763,6 +7794,80 @@ mod update_tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn mp_reach_nexthop_length_per_afi() {
+        // RFC 7606 §7.11: an unexpected next hop length resets the session.
+        let v4 = [192, 0, 2, 1];
+        let v6 = V6_NEXTHOP;
+        let ll = Ipv6Addr::from_str("fe80::1").unwrap().octets();
+        let cat = |parts: &[&[u8]]| parts.concat();
+        let rd = [0u8; 8];
+        let enh_caps = |f: Family| {
+            vec![
+                Capability::MultiProtocol(f),
+                Capability::ExtendedNexthop(vec![(f, Family::AFI_IP6)]),
+            ]
+        };
+        for (family, nexthop, enh, ok) in [
+            (Family::IPV6, v4.to_vec(), false, false),
+            (Family::IPV6, v6.to_vec(), false, true),
+            (Family::IPV6, cat(&[&v6, &ll]), false, true),
+            // RFC 2545 §3: the second address must be link-local.
+            (Family::IPV6, cat(&[&v6, &v6]), false, false),
+            (Family::IPV6_MPLS, v4.to_vec(), false, false),
+            (Family::IPV4, v4.to_vec(), false, true),
+            // RFC 8950: an IPv6 next hop needs the capability.
+            (Family::IPV4, v6.to_vec(), false, false),
+            (Family::IPV4, v6.to_vec(), true, true),
+            (Family::IPV4, cat(&[&v6, &ll]), true, true),
+            (Family::IPV4_VPN, cat(&[&rd, &v4]), false, true),
+            (Family::IPV4_VPN, cat(&[&rd, &v6]), false, false),
+            (Family::IPV4_VPN, cat(&[&rd, &v6]), true, true),
+        ] {
+            let caps = if enh {
+                enh_caps(family)
+            } else {
+                vec![Capability::MultiProtocol(family)]
+            };
+            let mut codec = PeerCodec::negotiate(&caps, &caps);
+            let buf = mp_reach_nexthop_update(family, &nexthop);
+            match codec.parse_message(&buf) {
+                Ok(_) if ok => {}
+                Err(Notification::UpdateOptionalAttributeError) if !ok => {}
+                r => panic!(
+                    "{family:?} {}-byte next hop, extended nexthop {enh}: got {:?}",
+                    nexthop.len(),
+                    r.err()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn extended_nexthop_is_negotiated_per_family() {
+        let local = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::MultiProtocol(Family::IPV4_VPN),
+            Capability::ExtendedNexthop(vec![
+                (Family::IPV4, Family::AFI_IP6),
+                (Family::IPV4_VPN, Family::AFI_IP6),
+            ]),
+        ];
+        let remote = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::MultiProtocol(Family::IPV4_VPN),
+            Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
+        ];
+        let codec = PeerCodec::negotiate(&local, &remote);
+        assert!(codec.family_state(Family::IPV4).unwrap().extended_nexthop);
+        assert!(
+            !codec
+                .family_state(Family::IPV4_VPN)
+                .unwrap()
+                .extended_nexthop
+        );
     }
 
     #[test]
