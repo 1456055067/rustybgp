@@ -750,7 +750,7 @@ impl Nexthop {
     }
 
     /// Whether `len` is a valid MP_REACH_NLRI Next Hop length for
-    /// `family`. `extended_nexthop` is true when RFC 8950 was negotiated
+    /// `family`. `extended_nexthop` is true when we advertised RFC 8950
     /// for the family. Families not listed are checked by `from_bytes`.
     fn len_is_valid(family: Family, len: u8, extended_nexthop: bool) -> bool {
         match family {
@@ -2546,8 +2546,11 @@ impl Message {
 pub struct FamilyState {
     pub addpath_rx: bool,
     pub addpath_tx: bool,
-    /// RFC 8950: both sides advertised an IPv6 next hop for this IPv4 family.
-    pub extended_nexthop: bool,
+    /// RFC 8950: we advertised Extended Next Hop for this IPv4 family, so
+    /// the peer may send us IPv6 next hops for it. The capability is a
+    /// receive capability: the peer's own advertisement only governs what
+    /// we may send.
+    pub extended_nexthop_rx: bool,
 }
 
 pub struct PeerCodec {
@@ -2628,14 +2631,15 @@ impl PeerCodec {
             if let Some(lc) = lmap.remove(&f) {
                 let addpath_rx = lc.addpath & 0x1 > 0 && rc.addpath & 0x2 > 0;
                 let addpath_tx = lc.addpath & 0x2 > 0 && rc.addpath & 0x1 > 0;
-                let family_extended_nexthop = lc.extended_nexthop && rc.extended_nexthop;
-                extended_nexthop |= family_extended_nexthop;
+                if lc.extended_nexthop && rc.extended_nexthop {
+                    extended_nexthop = true;
+                }
                 families.insert(
                     f,
                     FamilyState {
                         addpath_rx,
                         addpath_tx,
-                        extended_nexthop: family_extended_nexthop,
+                        extended_nexthop_rx: lc.extended_nexthop,
                     },
                 );
             }
@@ -3424,7 +3428,7 @@ impl PeerCodec {
                         }
                         // RFC 7606 §7.11: a next hop length that does not match
                         // the family hides where the NLRI start; reset the session.
-                        if !Nexthop::len_is_valid(family, nexthop_len, state.extended_nexthop) {
+                        if !Nexthop::len_is_valid(family, nexthop_len, state.extended_nexthop_rx) {
                             return Err(err);
                         }
                         let pos = c.position() as usize;
@@ -7876,7 +7880,7 @@ mod update_tests {
             (Family::IPV6, cat(&[&v6, &v6]), false, false),
             (Family::IPV6_MPLS, v4.to_vec(), false, false),
             (Family::IPV4, v4.to_vec(), false, true),
-            // RFC 8950: an IPv6 next hop needs the capability.
+            // RFC 8950: an IPv6 next hop needs our capability.
             (Family::IPV4, v6.to_vec(), false, false),
             (Family::IPV4, v6.to_vec(), true, true),
             (Family::IPV4, cat(&[&v6, &ll]), true, true),
@@ -7889,7 +7893,9 @@ mod update_tests {
             } else {
                 vec![Capability::MultiProtocol(family)]
             };
-            let mut codec = PeerCodec::negotiate(&caps, &caps);
+            // Only our side advertises Extended Next Hop (RFC 8950 §4).
+            let remote = vec![Capability::MultiProtocol(family)];
+            let mut codec = PeerCodec::negotiate(&caps, &remote);
             let buf = mp_reach_nexthop_update(family, &nexthop);
             match codec.parse_message(&buf) {
                 Ok(_) if ok => {}
@@ -7904,27 +7910,39 @@ mod update_tests {
     }
 
     #[test]
-    fn extended_nexthop_is_negotiated_per_family() {
+    fn extended_nexthop_rx_follows_local_advertisement_per_family() {
+        // RFC 8950 §4: a speaker may send an IPv6 next hop only if its peer
+        // advertised the capability, so what we accept depends on our own
+        // advertisement, per family.
         let local = vec![
-            Capability::MultiProtocol(Family::IPV4),
-            Capability::MultiProtocol(Family::IPV4_VPN),
-            Capability::ExtendedNexthop(vec![
-                (Family::IPV4, Family::AFI_IP6),
-                (Family::IPV4_VPN, Family::AFI_IP6),
-            ]),
-        ];
-        let remote = vec![
             Capability::MultiProtocol(Family::IPV4),
             Capability::MultiProtocol(Family::IPV4_VPN),
             Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
         ];
+        let remote = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::MultiProtocol(Family::IPV4_VPN),
+        ];
         let codec = PeerCodec::negotiate(&local, &remote);
-        assert!(codec.family_state(Family::IPV4).unwrap().extended_nexthop);
+        assert!(
+            codec
+                .family_state(Family::IPV4)
+                .unwrap()
+                .extended_nexthop_rx
+        );
         assert!(
             !codec
                 .family_state(Family::IPV4_VPN)
                 .unwrap()
-                .extended_nexthop
+                .extended_nexthop_rx
+        );
+        // The peer's advertisement alone does not let it send to us.
+        let codec = PeerCodec::negotiate(&remote, &local);
+        assert!(
+            !codec
+                .family_state(Family::IPV4)
+                .unwrap()
+                .extended_nexthop_rx
         );
     }
 
