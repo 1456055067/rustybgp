@@ -441,8 +441,8 @@ impl Condition {
             }
             Condition::Rpki(expected) => {
                 return rpki
-                    .and_then(|r| r.validate(source, net, attr))
-                    .is_some_and(|v| v.state == *expected);
+                    .and_then(|r| r.validation_state(source, net, attr))
+                    .is_some_and(|state| state == *expected);
             }
             Condition::LocalPrefEq(v) => {
                 return attr
@@ -4611,6 +4611,26 @@ mod tests {
                 "neighbor {addr}",
             );
         }
+    }
+
+    #[test]
+    fn rpki_condition_with_empty_roa_table_matches_not_found() {
+        // RFC 6811 section 2: with no ROAs loaded no ROA covers the route,
+        // so it is NotFound rather than unvalidated.
+        let rpki = RpkiTable::new();
+        let eval = |state| {
+            Condition::Rpki(state).evalute(
+                &source(),
+                &nlri(),
+                &Arc::new(vec![]),
+                None,
+                local_addr(),
+                Some(&rpki),
+            )
+        };
+        assert!(eval(RpkiValidationState::NotFound));
+        assert!(!eval(RpkiValidationState::Valid));
+        assert!(!eval(RpkiValidationState::Invalid));
     }
 
     #[test]

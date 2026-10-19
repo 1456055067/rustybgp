@@ -2367,6 +2367,25 @@ impl RpkiTable {
         Some(result)
     }
 
+    /// Validation state of a route for policy matching. Unlike
+    /// [`RpkiTable::validate`], an IP route with no ROAs loaded at all is
+    /// `NotFound` (RFC 6811 section 2: no covering ROA). `None` is returned
+    /// only for NLRI that RPKI does not apply to.
+    pub fn validation_state(
+        &self,
+        source: &Arc<Source>,
+        net: &packet::Nlri,
+        attr: &Arc<Vec<packet::Attribute>>,
+    ) -> Option<RpkiValidationState> {
+        match net {
+            packet::Nlri::V4(_) | packet::Nlri::V6(_) => Some(
+                self.validate(source, net, attr)
+                    .map_or(RpkiValidationState::NotFound, |v| v.state),
+            ),
+            _ => None,
+        }
+    }
+
     pub fn insert(&mut self, net: packet::IpNet, roa: Arc<Roa>) {
         let (family, key, mask) = match net {
             packet::IpNet::V4(net) => (Family::IPV4, net.addr.octets().to_vec(), net.mask),
@@ -6841,6 +6860,38 @@ mod tests {
         ]);
         assert!(validate(&t, "10.0.1.0/24", attr.clone()) == RpkiValidationState::Invalid);
         assert!(validate(&t, "192.0.2.0/24", attr) == RpkiValidationState::NotFound);
+    }
+
+    #[test]
+    fn rpki_empty_table_state_is_not_found() {
+        let t = RpkiTable::new();
+        let src = source(1, 65001, 65100, 1);
+        assert!(
+            t.validation_state(&src, &route("10.0.1.0/24"), &origin_seq(65001))
+                == Some(RpkiValidationState::NotFound)
+        );
+        assert!(
+            t.validation_state(&src, &route("2001:db8::/32"), &origin_seq(65001))
+                == Some(RpkiValidationState::NotFound)
+        );
+        // Only IPv6 ROAs loaded: IPv4 routes are still NotFound.
+        let mut t = RpkiTable::new();
+        t.insert(
+            packet::IpNet::new("2001:db8::".parse().unwrap(), 32),
+            Arc::new(Roa::new(
+                48,
+                65001,
+                Arc::new(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            )),
+        );
+        assert!(
+            t.validation_state(&src, &route("10.0.1.0/24"), &origin_seq(65001))
+                == Some(RpkiValidationState::NotFound)
+        );
+        assert!(
+            t.validation_state(&src, &route("2001:db8:1::/48"), &origin_seq(65001))
+                == Some(RpkiValidationState::Valid)
+        );
     }
 
     #[test]
