@@ -1067,12 +1067,26 @@ impl Table {
         self.collect_loc_rib_paths_impl(family, usize::MAX)
     }
 
+    /// Like [`Self::collect_loc_rib_paths`], capped at `max_paths` per
+    /// destination, for exporting to a peer (initial dump, route refresh).
+    ///
+    /// Returns nothing while `family` is deferred: best paths aren't final
+    /// until selection deferral ends (RFC 4724 §4.2), and `end_deferral()`
+    /// distributes them then.
     pub fn collect_loc_rib_paths_limited(
         &self,
         family: &Family,
         max_paths: usize,
     ) -> Vec<NlriChange> {
+        if self.is_deferring(family) {
+            return Vec::new();
+        }
         self.collect_loc_rib_paths_impl(family, max_paths)
+    }
+
+    /// True while best-path selection for `family` is deferred.
+    pub fn is_deferring(&self, family: &Family) -> bool {
+        self.ribs.get(family).is_some_and(|r| r.deferring)
     }
 
     pub fn state(&self, family: Family) -> TableState {
@@ -5413,6 +5427,26 @@ mod tests {
             !rt.ribs.get(&Family::IPV4).unwrap().deferring,
             "deferring flag must be cleared"
         );
+    }
+
+    #[test]
+    fn deferral_hides_routes_from_peer_exports() {
+        // The initial dump and route refresh must not export best paths that
+        // selection deferral hasn't settled yet.
+        let mut rt = Table::new(0);
+        rt.start_deferral(Family::IPV4);
+        let s = source(1, 65001, 65000, 1);
+        insert_with_attrs(&mut rt, &s, &nlri(10, 0, 0, 0, 24), attrs_with_origin(0));
+
+        assert!(rt.is_deferring(&Family::IPV4));
+        assert!(
+            rt.collect_loc_rib_paths_limited(&Family::IPV4, 1)
+                .is_empty()
+        );
+
+        rt.end_deferral(Family::IPV4);
+        assert!(!rt.is_deferring(&Family::IPV4));
+        assert_eq!(rt.collect_loc_rib_paths_limited(&Family::IPV4, 1).len(), 1);
     }
 
     #[test]

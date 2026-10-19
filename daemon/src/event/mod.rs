@@ -626,6 +626,10 @@ pub(crate) enum ToPeerEvent {
     /// Re-advertise all current best paths for the specified families.
     /// Used by RTC to export VPN routes after the EOR marker (or timer) arrives.
     RouteRefreshFamilies(Vec<Family>),
+    /// Selection deferral ended for these families and their routes have been
+    /// distributed: send the End-of-RIB withheld from sessions that
+    /// established during deferral (RFC 4724 §4.2).
+    DeferralComplete(Vec<Family>),
 }
 
 pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) {
@@ -2601,6 +2605,12 @@ struct PeerSession {
     keepalive_futures: FuturesUnordered<tokio::time::Sleep>,
     holdtime_futures: FuturesUnordered<tokio::time::Sleep>,
     pending: FnvHashMap<Family, crate::peer_tx::PendingTx>,
+    /// Families whose initial End-of-RIB is withheld until selection deferral
+    /// ends (local speaker restarting, RFC 4724 §4.2).
+    deferred_eor: FnvHashSet<Family>,
+    /// Families whose route refresh was requested during deferral; re-run on
+    /// `DeferralComplete`.
+    deferred_refresh: FnvHashSet<Family>,
     txbuf_size: usize,
 }
 
@@ -2678,6 +2688,8 @@ impl PeerSession {
                 .into_iter()
                 .collect(),
             pending: FnvHashMap::default(),
+            deferred_eor: FnvHashSet::default(),
+            deferred_refresh: FnvHashSet::default(),
             txbuf_size,
         })
     }
@@ -2756,6 +2768,8 @@ impl PeerSession {
                 .into_iter()
                 .collect(),
             pending: FnvHashMap::default(),
+            deferred_eor: FnvHashSet::default(),
+            deferred_refresh: FnvHashSet::default(),
             txbuf_size: 1 << 16,
         }
     }
@@ -2943,12 +2957,19 @@ impl PeerSession {
         } else {
             None
         };
+        // Families still under selection deferral (we are the restarting
+        // speaker): the shard exports nothing for them, and their End-of-RIB
+        // waits for DeferralComplete.
+        let mut deferred: FnvHashSet<Family> = FnvHashSet::default();
         let peer_event_rx = self
             .tables
             .register_peer(self.remote_addr, addpath, |rtable| {
                 for f in &families {
                     if rtc_awaiting_eor && crate::rtc::is_vpn_family(*f) {
                         continue;
+                    }
+                    if rtable.is_deferring(f) {
+                        deferred.insert(*f);
                     }
                     let effective_max = family_effective_max.get(f).copied().unwrap_or(1);
                     let addpath_tx = self.pending.get(f).map(|p| p.addpath_tx()).unwrap_or(false);
@@ -2987,11 +3008,15 @@ impl PeerSession {
             if rtc_awaiting_eor && crate::rtc::is_vpn_family(*f) {
                 continue;
             }
+            if deferred.contains(f) {
+                continue;
+            }
             self.pending
                 .get_mut(f)
                 .unwrap()
                 .buffer_messages(vec![bgp::Message::eor(*f)]);
         }
+        self.deferred_eor = deferred;
         let remote_holdtime = HoldTime::new(self.state.remote_holdtime.load(Ordering::Relaxed))
             .unwrap_or(HoldTime::DISABLED);
         self.tables.peer_up(PeerUpData {
@@ -3019,8 +3044,27 @@ impl PeerSession {
         });
     }
 
+    /// Selection deferral ended for `families`; their routes already arrived
+    /// as NlriChange events.  Send the withheld End-of-RIB, or redo a route
+    /// refresh that was requested meanwhile (it sends its own EOR).
+    async fn on_deferral_complete(&mut self, families: Vec<Family>) {
+        for family in families {
+            let eor = self.deferred_eor.remove(&family);
+            if self.deferred_refresh.remove(&family) {
+                self.do_route_refresh(family).await;
+            } else if eor && let Some(pending) = self.pending.get_mut(&family) {
+                pending.schedule_eor();
+            }
+        }
+    }
+
     async fn do_route_refresh(&mut self, family: Family) {
         if !self.pending.contains_key(&family) {
+            return;
+        }
+        if self.tables.is_deferring(family) {
+            // Nothing is exported until deferral ends; redo it then.
+            self.deferred_refresh.insert(family);
             return;
         }
         // For VPN families in Active state, build the RT filter from current adj-in RTC paths.
@@ -3823,6 +3867,9 @@ impl PeerSession {
                         for family in families {
                             self.do_route_refresh(family).await;
                         }
+                    }
+                    Some(Some(ToPeerEvent::DeferralComplete(families))) => {
+                        self.on_deferral_complete(families).await;
                     }
                     Some(None) => {
                         self.peer_event_rx = None;
@@ -7382,6 +7429,42 @@ local-address = "{local}"
         let ctx = context.lock().unwrap();
         assert!(ctx.gr_state.is_awaiting_eor());
         assert!(ctx.gr_restart_timer.is_some());
+    }
+
+    #[tokio::test]
+    async fn deferral_complete_releases_withheld_eor() {
+        let tables = make_tables();
+        let context = make_context();
+        let mut session = PeerSession::new_for_test("10.0.0.1".parse().unwrap(), context, tables);
+        session
+            .pending
+            .insert(Family::IPV4, crate::peer_tx::PendingTx::new(false));
+        session
+            .pending
+            .insert(Family::IPV6, crate::peer_tx::PendingTx::new(false));
+        session.deferred_eor.insert(Family::IPV4);
+
+        // IPv6 wasn't deferred for this session: no second EOR for it.
+        session
+            .on_deferral_complete(vec![Family::IPV4, Family::IPV6])
+            .await;
+
+        let v4 = session
+            .pending
+            .get_mut(&Family::IPV4)
+            .unwrap()
+            .drain_messages(Family::IPV4);
+        assert!(matches!(
+            v4.as_slice(),
+            [bgp::Message::Update(bgp::Update::EndOfRib(Family::IPV4))]
+        ));
+        let v6 = session
+            .pending
+            .get_mut(&Family::IPV6)
+            .unwrap()
+            .drain_messages(Family::IPV6);
+        assert!(v6.is_empty());
+        assert!(session.deferred_eor.is_empty());
     }
 
     // ---- process_effects: GrEorReceived (helper side) ----
