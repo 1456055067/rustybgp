@@ -3032,6 +3032,9 @@ impl PeerCodec {
         };
         Nlri::decode(family, c, len, is_reach).map(|nlri| PathNlri { path_id: id, nlri })
     }
+
+    /// Decode an NLRI or Withdrawn Routes field. Any error is a syntax
+    /// error in the field: the caller sends Invalid Network Field.
     fn decode_nlri_list(
         family: Family,
         addpath_rx: bool,
@@ -3382,7 +3385,8 @@ impl PeerCodec {
                         addpath_rx,
                         true,
                         &buf[c.position() as usize..],
-                    )?;
+                    )
+                    .map_err(|_| Notification::UpdateInvalidNetworkField)?;
                 }
 
                 if 0 < withdrawn_len {
@@ -3397,7 +3401,8 @@ impl PeerCodec {
                         addpath_rx,
                         false,
                         &buf[start..start + withdrawn_len as usize],
-                    )?;
+                    )
+                    .map_err(|_| Notification::UpdateInvalidNetworkField)?;
                 }
 
                 let mp_reach: Option<(Family, Vec<PathNlri>, Option<Nexthop>)> =
@@ -3445,7 +3450,8 @@ impl PeerCodec {
                             addpath_rx,
                             true,
                             &buf[c.position() as usize..],
-                        )?;
+                        )
+                        .map_err(|_| Notification::UpdateInvalidNetworkField)?;
                         Some((family, entries, nexthop))
                     } else {
                         None
@@ -3467,7 +3473,8 @@ impl PeerCodec {
                         addpath_rx,
                         false,
                         &buf[c.position() as usize..],
-                    )?;
+                    )
+                    .map_err(|_| Notification::UpdateInvalidNetworkField)?;
                     Some((family, entries))
                 } else {
                     None
@@ -8037,6 +8044,37 @@ mod update_tests {
             ipv6_codec().parse_message(&buf),
             Err(Notification::UpdateAttributeFlagsError { .. })
         ));
+    }
+
+    #[test]
+    fn nlri_syntax_errors_send_invalid_network_field() {
+        // RFC 4271 §6.3, RFC 7606 §5.3: prefix length over 32, or a prefix
+        // running past the end of the field.
+        for bad in [&[33, 10, 0, 0, 0, 0][..], &[24, 10, 0][..]] {
+            for (withdrawn, nlri) in [(bad, &[][..]), (&[][..], bad)] {
+                let attrs = if nlri.is_empty() {
+                    vec![]
+                } else {
+                    base_attrs()
+                };
+                let buf = raw_update(withdrawn, &attrs, nlri);
+                match ipv4_codec().parse_message(&buf) {
+                    Err(Notification::UpdateInvalidNetworkField) => {}
+                    r => panic!("{bad:?}: expected Invalid Network Field, got {:?}", r.err()),
+                }
+            }
+        }
+        let mut codec = ipv6_codec();
+        for mp in [
+            mp_reach_attr(0x80, Family::IPV6, &V6_NEXTHOP, &[129, 0x20]),
+            mp_unreach_attr(0x80, Family::IPV6, &[64, 0x20, 0x01]),
+        ] {
+            let buf = raw_update(&[], &mp, &[]);
+            match codec.parse_message(&buf) {
+                Err(Notification::UpdateInvalidNetworkField) => {}
+                r => panic!("expected Invalid Network Field, got {:?}", r.err()),
+            }
+        }
     }
 
     #[test]
