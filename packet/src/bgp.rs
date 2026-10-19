@@ -1356,6 +1356,32 @@ impl Attribute {
         self.flags
     }
 
+    /// RFC 4271 Section 4.3: the Partial bit must be 0 for well-known and
+    /// optional non-transitive attributes.
+    fn partial_is_invalid(flags: u8) -> bool {
+        flags & Self::FLAG_PARTIAL != 0
+            && (flags & Self::FLAG_OPTIONAL == 0 || flags & Self::FLAG_TRANSITIVE == 0)
+    }
+
+    /// Whether this AS_PATH has an AS_CONFED_SEQUENCE or AS_CONFED_SET
+    /// segment.
+    fn as_path_has_confed(&self) -> bool {
+        let Some(buf) = self.binary() else {
+            return false;
+        };
+        let mut pos = 0;
+        while pos + 2 <= buf.len() {
+            if matches!(
+                buf[pos],
+                Self::AS_PATH_TYPE_CONFED_SEQ | Self::AS_PATH_TYPE_CONFED_SET
+            ) {
+                return true;
+            }
+            pos += 2 + buf[pos + 1] as usize * 4;
+        }
+        false
+    }
+
     /// Decode one complete BGP attribute, using four-octet AS numbers as in
     /// GoBGP's binary gRPC representation. Reject truncation and trailing data.
     pub fn decode_from_bytes(bytes: &[u8]) -> Result<Self, Notification> {
@@ -1376,11 +1402,7 @@ impl Attribute {
             None if flags & Self::FLAG_OPTIONAL == 0 => return Err(invalid()),
             _ => {}
         }
-        // RFC 4271 Section 4.3: the Partial bit must be 0 for well-known and
-        // optional non-transitive attributes.
-        if flags & Self::FLAG_PARTIAL != 0
-            && (flags & Self::FLAG_OPTIONAL == 0 || flags & Self::FLAG_TRANSITIVE == 0)
-        {
+        if Self::partial_is_invalid(flags) {
             return Err(invalid());
         }
         let len = if flags & Self::FLAG_EXTENDED != 0 {
@@ -1546,8 +1568,10 @@ impl Attribute {
                         }
                         let seg_type = b[pos];
                         let seg_count = b[pos + 1] as usize;
+                        // RFC 7606 §7.2: a zero Path Segment Length is malformed.
                         if !(Self::AS_PATH_TYPE_SET..=Self::AS_PATH_TYPE_CONFED_SET)
                             .contains(&seg_type)
+                            || seg_count == 0
                         {
                             return Err(());
                         }
@@ -1575,8 +1599,10 @@ impl Attribute {
                         }
                         let seg_type = b[pos];
                         let seg_count = b[pos + 1] as usize;
+                        // RFC 7606 §7.2: a zero Path Segment Length is malformed.
                         if !(Self::AS_PATH_TYPE_SET..=Self::AS_PATH_TYPE_CONFED_SET)
                             .contains(&seg_type)
+                            || seg_count == 0
                         {
                             return Err(());
                         }
@@ -1615,8 +1641,10 @@ impl Attribute {
                 }
             }
             Self::COMMUNITY => {
-                // RFC 1997 §4: each community value is 4 octets
-                if !len.is_multiple_of(4) {
+                // RFC 1997 §4: each community value is 4 octets. Here and
+                // below, RFC 7606 §7.8, §7.10, §7.14 and RFC 8092 §6 make an
+                // empty list malformed.
+                if len == 0 || !len.is_multiple_of(4) {
                     return Err(());
                 }
                 let mut b = vec![0u8; len as usize];
@@ -1625,7 +1653,7 @@ impl Attribute {
             }
             Self::EXTENDED_COMMUNITY => {
                 // RFC 4360 §4: each extended community value is 8 octets
-                if !len.is_multiple_of(8) {
+                if len == 0 || !len.is_multiple_of(8) {
                     return Err(());
                 }
                 let mut b = vec![0u8; len as usize];
@@ -1634,7 +1662,7 @@ impl Attribute {
             }
             Self::CLUSTER_LIST => {
                 // RFC 4456 §8: each cluster ID is 4 octets
-                if !len.is_multiple_of(4) {
+                if len == 0 || !len.is_multiple_of(4) {
                     return Err(());
                 }
                 let mut b = vec![0u8; len as usize];
@@ -1643,7 +1671,7 @@ impl Attribute {
             }
             Self::LARGE_COMMUNITY => {
                 // RFC 8092 §2: each large community value is 12 octets
-                if !len.is_multiple_of(12) {
+                if len == 0 || !len.is_multiple_of(12) {
                     return Err(());
                 }
                 let mut b = vec![0u8; len as usize];
@@ -2021,6 +2049,19 @@ impl Attribute {
     }
 
     pub(crate) fn encode_wire<B: BufMut + AsMut<[u8]>>(&self, dst: &mut B) -> u16 {
+        // An empty COMMUNITY, EXTENDED_COMMUNITY, LARGE_COMMUNITY or
+        // CLUSTER_LIST is malformed (RFC 7606 §7.8, §7.10, §7.14, RFC 8092
+        // §6) and makes the receiver withdraw the route; leave it out.
+        if matches!(
+            self.code,
+            Attribute::COMMUNITY
+                | Attribute::EXTENDED_COMMUNITY
+                | Attribute::LARGE_COMMUNITY
+                | Attribute::CLUSTER_LIST
+        ) && self.binary().is_some_and(|b| b.is_empty())
+        {
+            return 0;
+        }
         self.encode(dst).unwrap()
     }
 
@@ -2173,11 +2214,13 @@ pub enum AttributeErrorAction {
 
 impl AttributeError {
     /// True when the received Optional or Transitive bit conflicts with
-    /// the attribute's definition.
+    /// the attribute's definition, or the Partial bit is set where RFC 4271
+    /// §4.3 requires it to be 0.
     fn flags_conflict(&self) -> bool {
         Attribute::canonical_flags(self.attr_code).is_some_and(|expected| {
             (self.attr_flags ^ expected) & (Attribute::FLAG_OPTIONAL | Attribute::FLAG_TRANSITIVE)
                 != 0
+                || Attribute::partial_is_invalid(self.attr_flags)
         })
     }
 
@@ -2368,6 +2411,12 @@ fn validate_update(
                             | Family::IPV6_FLOWSPEC_VPN
                     )
             });
+            // RFC 5065 §3: a peer outside the confederation must not send
+            // AS_CONFED_SEQUENCE or AS_CONFED_SET segments.
+            let confed_from_ebgp = is_ebgp
+                && attrs
+                    .iter()
+                    .any(|a| a.code() == Attribute::AS_PATH && a.as_path_has_confed());
             let missing_mandatory = (reach.is_some() || mp_reach.is_some())
                 && (!attrs.iter().any(|a| a.code() == Attribute::ORIGIN)
                     || !attrs.iter().any(|a| a.code() == Attribute::AS_PATH)
@@ -2377,6 +2426,7 @@ fn validate_update(
             // RFC 7606 §3 (h): the strongest approach among the errors wins.
             // Discarded attributes are already absent from attrs.
             let treat_as_withdraw = missing_mandatory
+                || confed_from_ebgp
                 || error_attrs.iter().any(|e| {
                     e.action(is_ebgp, reach.is_some()) == AttributeErrorAction::TreatAsWithdraw
                 });
@@ -3206,6 +3256,7 @@ impl PeerCodec {
                             if (flags ^ expected_flags)
                                 & (Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL)
                                 > 0
+                                || Attribute::partial_is_invalid(flags)
                             {
                                 if code == Attribute::MP_REACH || code == Attribute::MP_UNREACH {
                                     // RFC 7606 §5.3: an MP attribute whose flags
@@ -7868,6 +7919,124 @@ mod update_tests {
                 .unwrap()
                 .extended_nexthop
         );
+    }
+
+    /// ORIGIN IGP, `as_path` as the AS_PATH value, NEXT_HOP 192.0.2.1.
+    fn update_with_as_path(as_path: &[u8]) -> Vec<u8> {
+        let mut attrs = vec![0x40, 0x01, 0x01, 0x00, 0x40, 0x02, as_path.len() as u8];
+        attrs.extend_from_slice(as_path);
+        attrs.extend_from_slice(&[0x40, 0x03, 0x04, 192, 0, 2, 1]);
+        raw_update(&[], &attrs, &[0x08, 0x0a])
+    }
+
+    #[test]
+    fn as_path_zero_length_segment_treat_as_withdraw() {
+        // RFC 7606 §7.2.
+        let four = [0x02, 0x01, 0, 0, 0xfd, 0xea, 0x02, 0x00];
+        let buf = update_with_as_path(&four);
+        let msgs = validate(&mut ipv4_codec(), &buf, false).unwrap();
+        assert!(is_unreach(&msgs[0], Family::IPV4));
+
+        let two = [0x02, 0x01, 0xfd, 0xea, 0x01, 0x00];
+        let buf = update_with_as_path(&two);
+        let mut codec = ipv4_codec();
+        codec.two_byte_as = true;
+        let msgs = validate(&mut codec, &buf, false).unwrap();
+        assert!(is_unreach(&msgs[0], Family::IPV4));
+    }
+
+    #[test]
+    fn confed_segment_from_ebgp_treat_as_withdraw() {
+        // RFC 5065 §3.
+        for seg_type in [
+            Attribute::AS_PATH_TYPE_CONFED_SEQ,
+            Attribute::AS_PATH_TYPE_CONFED_SET,
+        ] {
+            let as_path = [
+                seg_type, 0x01, 0, 0, 0xfd, 0xe9, 0x02, 0x01, 0, 0, 0xfd, 0xea,
+            ];
+            let buf = update_with_as_path(&as_path);
+            let msgs = validate(&mut ipv4_codec(), &buf, true).unwrap();
+            assert!(is_unreach(&msgs[0], Family::IPV4), "eBGP, type {seg_type}");
+            // A confederation or internal peer may send them.
+            let msgs = validate(&mut ipv4_codec(), &buf, false).unwrap();
+            assert!(
+                matches!(&msgs[0], Message::Update(Update::Reach { .. })),
+                "iBGP, type {seg_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_list_attributes_treat_as_withdraw() {
+        for code in [
+            Attribute::COMMUNITY,
+            Attribute::EXTENDED_COMMUNITY,
+            Attribute::LARGE_COMMUNITY,
+            Attribute::CLUSTER_LIST,
+        ] {
+            let flags = Attribute::canonical_flags(code).unwrap();
+            let (withdrawn, _) = withdrawn_with(&[flags, code, 0], false);
+            assert!(withdrawn, "empty attribute {code}");
+        }
+    }
+
+    #[test]
+    fn empty_list_attributes_are_not_encoded() {
+        let attr = Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::empty_as_path(),
+            Attribute::new_with_bin(Attribute::COMMUNITY, vec![]).unwrap(),
+            Attribute::new_with_bin(Attribute::EXTENDED_COMMUNITY, vec![]).unwrap(),
+            Attribute::new_with_bin(Attribute::LARGE_COMMUNITY, vec![]).unwrap(),
+        ]);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![PathNlri::new("10.0.0.0/8".parse().unwrap())],
+            nexthop: Some(Nexthop::V4(Ipv4Addr::new(192, 0, 2, 1))),
+            attr,
+        });
+        let mut buf = BytesMut::new();
+        ipv4_codec().encode_to(&msg, &mut buf).unwrap();
+        let msgs = validate(&mut ipv4_codec(), &buf, false).unwrap();
+        assert_eq!(msgs.len(), 1);
+        let attrs = reach_attrs(&msgs);
+        assert!(attrs.iter().all(|a| !matches!(
+            a.code(),
+            Attribute::COMMUNITY | Attribute::EXTENDED_COMMUNITY | Attribute::LARGE_COMMUNITY
+        )));
+    }
+
+    #[test]
+    fn partial_bit_on_well_known_or_non_transitive_treat_as_withdraw() {
+        // RFC 4271 §4.3: the Partial bit must be 0 for these attributes.
+        for (name, extra) in [
+            ("ATOMIC_AGGREGATE", &[0x60, 0x06, 0x00][..]),
+            ("MED", &[0xa0, 0x04, 0x04, 0, 0, 0, 1][..]),
+        ] {
+            let (withdrawn, _) = withdrawn_with(extra, false);
+            assert!(withdrawn, "{name} with Partial bit");
+        }
+        // Optional transitive attributes may carry it.
+        let (withdrawn, msgs) = withdrawn_with(&[0xe0, 0x08, 0x04, 0xfd, 0xe9, 0, 1], false);
+        assert!(!withdrawn);
+        assert!(
+            reach_attrs(&msgs)
+                .iter()
+                .any(|a| a.code() == Attribute::COMMUNITY)
+        );
+    }
+
+    #[test]
+    fn partial_bit_on_mp_reach_resets_session() {
+        let mp = mp_reach_attr(0xa0, Family::IPV6, &V6_NEXTHOP, &V6_NLRI);
+        let mut attrs = base_attrs();
+        attrs.extend_from_slice(&mp);
+        let buf = raw_update(&[], &attrs, &[]);
+        assert!(matches!(
+            ipv6_codec().parse_message(&buf),
+            Err(Notification::UpdateAttributeFlagsError { .. })
+        ));
     }
 
     #[test]
