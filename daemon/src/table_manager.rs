@@ -604,7 +604,6 @@ impl TableManager {
         if changes.is_empty() {
             return;
         }
-        let rpki = self.rpki.read().unwrap();
         let import_policy = self.import_policy.load_full().filter(|p| p.needs_rpki);
         let kernel_handle = self.kernel_handle.load_full();
         let nht_set = self.nexthop_invalid.load_full();
@@ -612,6 +611,8 @@ impl TableManager {
         for shard in &self.shards {
             let mut t = shard.lock().unwrap();
             if let Some(policy) = import_policy.as_deref() {
+                // Shard lock before the ROA table lock, as in insert_route.
+                let rpki = self.rpki.read().unwrap();
                 let paths = t.rtable.collect_rpki_affected_paths(changes);
                 t.reapply_import(
                     &subs,
