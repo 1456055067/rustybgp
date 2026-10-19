@@ -1490,6 +1490,15 @@ impl Attribute {
                 }
                 AttributeData::Val(val)
             }
+            Self::NEXTHOP => {
+                // RFC 4271 §5.1.3, RFC 7606 §7.3: an IPv4 address.
+                if len != 4 {
+                    return Err(());
+                }
+                let mut b = vec![0u8; 4];
+                c.read_exact(&mut b).map_err(|_| ())?;
+                AttributeData::Bin(b)
+            }
             Self::MULTI_EXIT_DESC | Self::LOCAL_PREF | Self::ORIGINATOR_ID => {
                 if len != 4 {
                     return Err(());
@@ -2247,6 +2256,10 @@ pub enum ParsedMessage {
 /// eBGP peer.  When true, LOCAL_PREF, ORIGINATOR_ID, and CLUSTER_LIST are silently
 /// discarded per RFC 4271 §5.1.5 and RFC 4456 §8.
 ///
+/// `local_addr` is this speaker's address on the session. A route whose next
+/// hop is that address, or is not a valid unicast address, is treated as
+/// withdrawn (RFC 4271 §6.3).
+///
 /// Returns `Err(Notification)` when the session must send that `Notification`
 /// and close.  Returns `Ok(iter)` otherwise; the iterator yields the resulting
 /// `Message`s (normally 1, 2 for a multi-family UPDATE, 0 for discard-only
@@ -2254,10 +2267,11 @@ pub enum ParsedMessage {
 pub fn validate_message(
     msg: ParsedMessage,
     is_ebgp: bool,
+    local_addr: Option<IpAddr>,
 ) -> Result<impl Iterator<Item = Message>, Notification> {
     let msgs: Vec<Message> = match msg {
         ParsedMessage::Open(open) => vec![Message::Open(open)],
-        ParsedMessage::Update(update) => validate_update(update, is_ebgp)?,
+        ParsedMessage::Update(update) => validate_update(update, is_ebgp, local_addr)?,
         ParsedMessage::Notification(n) => vec![Message::Notification(n)],
         ParsedMessage::Keepalive => vec![Message::Keepalive],
         ParsedMessage::RouteRefresh { family } => vec![Message::RouteRefresh { family }],
@@ -2265,7 +2279,41 @@ pub fn validate_message(
     Ok(msgs.into_iter())
 }
 
-fn validate_update(update: ParsedUpdate, is_ebgp: bool) -> Result<Vec<Message>, Notification> {
+/// RFC 4271 §6.3: a syntactically correct NEXT_HOP that is semantically
+/// invalid: not a unicast address (0.0.0.0, multicast, class E) or the
+/// address of the receiving speaker.
+fn nexthop_is_invalid(nexthop: &Nexthop, local_addr: Option<IpAddr>) -> bool {
+    if local_addr.is_some_and(|l| l.to_canonical() == nexthop.addr().to_canonical()) {
+        return true;
+    }
+    match nexthop {
+        Nexthop::V4(a) => a.is_unspecified() || a.is_multicast() || a.octets()[0] >= 240,
+        Nexthop::V6(a) => a.is_unspecified() || a.is_multicast(),
+        Nexthop::V6LinkLocal(a, _) => a.is_multicast(),
+    }
+}
+
+/// Families whose next hop is the unicast forwarding address of the route,
+/// so `nexthop_is_invalid` applies.
+fn nexthop_is_forwarding_address(family: Family) -> bool {
+    matches!(
+        family,
+        Family::IPV4
+            | Family::IPV6
+            | Family::IPV4_MC
+            | Family::IPV6_MC
+            | Family::IPV4_MPLS
+            | Family::IPV6_MPLS
+            | Family::IPV4_VPN
+            | Family::IPV6_VPN
+    )
+}
+
+fn validate_update(
+    update: ParsedUpdate,
+    is_ebgp: bool,
+    local_addr: Option<IpAddr>,
+) -> Result<Vec<Message>, Notification> {
     match update {
         ParsedUpdate::EndOfRib(family) => Ok(vec![Message::Update(Update::EndOfRib(family))]),
         ParsedUpdate::Routes {
@@ -2357,14 +2405,29 @@ fn validate_update(update: ParsedUpdate, is_ebgp: bool) -> Result<Vec<Message>, 
             // Normal path: attribute-discard errors are already absent from attrs.
             let attr = Arc::new(attrs);
             let mut msgs: Vec<Message> = Vec::new();
+            // RFC 4271 §6.3: routes with a semantically invalid next hop are
+            // ignored, which for routes replacing earlier ones means withdrawn.
+            let to_message = |r: ReachNlri| {
+                let invalid = nexthop_is_forwarding_address(r.family)
+                    && r.nexthop
+                        .is_some_and(|n| nexthop_is_invalid(&n, local_addr));
+                if invalid {
+                    Message::Update(Update::Unreach {
+                        family: r.family,
+                        entries: r.entries,
+                    })
+                } else {
+                    Message::Update(Update::Reach {
+                        family: r.family,
+                        entries: r.entries,
+                        nexthop: r.nexthop,
+                        attr: attr.clone(),
+                    })
+                }
+            };
 
             if let Some(r) = reach {
-                msgs.push(Message::Update(Update::Reach {
-                    family: r.family,
-                    entries: r.entries,
-                    nexthop: r.nexthop,
-                    attr: attr.clone(),
-                }));
+                msgs.push(to_message(r));
             }
             if let Some(u) = unreach {
                 msgs.push(Message::Update(Update::Unreach {
@@ -2373,12 +2436,7 @@ fn validate_update(update: ParsedUpdate, is_ebgp: bool) -> Result<Vec<Message>, 
                 }));
             }
             if let Some(r) = mp_reach {
-                msgs.push(Message::Update(Update::Reach {
-                    family: r.family,
-                    entries: r.entries,
-                    nexthop: r.nexthop,
-                    attr,
-                }));
+                msgs.push(to_message(r));
             }
             if let Some(u) = mp_unreach {
                 msgs.push(Message::Update(Update::Unreach {
@@ -7025,7 +7083,7 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
@@ -7040,7 +7098,7 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
@@ -7056,7 +7114,7 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
         if let Message::Update(Update::Reach { attr, .. }) = &msgs[0] {
@@ -7075,7 +7133,7 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
@@ -7094,7 +7152,7 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
@@ -7113,7 +7171,7 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
@@ -7134,7 +7192,7 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, true).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, true, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
         if let Message::Update(Update::Reach { attr, .. }) = &msgs[0] {
@@ -7151,7 +7209,7 @@ mod update_tests {
         let parsed = ipv4_codec()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         if let Message::Update(Update::Reach { attr, .. }) = &msgs[0] {
             assert!(attr.iter().any(|a| a.code() == Attribute::LOCAL_PREF));
@@ -7190,7 +7248,7 @@ mod update_tests {
         attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xc0, 0x00, 0x02, 0x01]);
         let buf = raw_update_with_attrs(&attr_bytes);
         let parsed = ipv4_codec().parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
@@ -7202,7 +7260,7 @@ mod update_tests {
         attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xc0, 0x00, 0x02, 0x01]);
         let buf = raw_update_with_attrs(&attr_bytes);
         let parsed = ipv4_codec().parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
@@ -7214,7 +7272,7 @@ mod update_tests {
         attr_bytes.extend_from_slice(&[0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xea]);
         let buf = raw_update_with_attrs(&attr_bytes);
         let parsed = ipv4_codec().parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
     }
@@ -7223,7 +7281,7 @@ mod update_tests {
     fn missing_nexthop_attr_with_mpreach_ok() {
         let buf = raw_ipv6_mpreach_update();
         let parsed = ipv6_codec().parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
     }
@@ -7258,7 +7316,7 @@ mod update_tests {
         let mut codec = PeerCodec::new();
         codec.set_family(Family::IPV4_FLOWSPEC, Default::default());
         let parsed = codec.parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
     }
@@ -7308,7 +7366,7 @@ mod update_tests {
         let mut codec = ipv4_codec();
         let buf = update_with_aigp(0x80);
         let parsed = codec.parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert!(
             msgs.iter()
                 .any(|m| matches!(m, Message::Update(Update::Reach { .. })))
@@ -7320,7 +7378,7 @@ mod update_tests {
         let mut codec = ipv4_codec();
         let buf = update_with_aigp(0xC0);
         let parsed = codec.parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert!(
             msgs.iter()
                 .all(|m| matches!(m, Message::Update(Update::Unreach { .. })))
@@ -7332,7 +7390,7 @@ mod update_tests {
         let mut codec = ipv4_codec();
         let buf = update_with_unknown_optional_attrs();
         let parsed = codec.parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         let attr = match &msgs[0] {
             Message::Update(Update::Reach { attr, .. }) => attr,
             _ => panic!("expected Reach message"),
@@ -7352,7 +7410,7 @@ mod update_tests {
         let mut codec = ipv4_codec();
         let buf = update_with_unknown_optional_attrs();
         let parsed = codec.parse_message(&buf).expect("parse ok");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         let attr = match &msgs[0] {
             Message::Update(Update::Reach { attr, .. }) => attr,
             _ => panic!("expected Reach message"),
@@ -7414,7 +7472,7 @@ mod update_tests {
         is_ebgp: bool,
     ) -> Result<Vec<Message>, Notification> {
         let parsed = codec.parse_message(buf).expect("parse must not fail");
-        validate_message(parsed, is_ebgp).map(|i| i.collect())
+        validate_message(parsed, is_ebgp, None).map(|i| i.collect())
     }
 
     fn is_unreach(m: &Message, family: Family) -> bool {
@@ -7619,6 +7677,92 @@ mod update_tests {
         let msgs = validate(&mut ipv6_codec(), &buf, false).unwrap();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
+    }
+
+    fn ipv4_update_with_nexthop(nexthop: &[u8]) -> Vec<u8> {
+        let mut attrs = vec![0x40, 0x01, 0x01, 0x00, 0x40, 0x02, 0x00, 0x40, 0x03];
+        attrs.push(nexthop.len() as u8);
+        attrs.extend_from_slice(nexthop);
+        raw_update(&[], &attrs, &[0x08, 0x0a])
+    }
+
+    #[test]
+    fn nexthop_length_must_be_4() {
+        // RFC 7606 §7.3: treat-as-withdraw.
+        for nh in [&[192, 0, 2][..], &[192, 0, 2, 1, 0], &[0x20; 16], &[]] {
+            let buf = ipv4_update_with_nexthop(nh);
+            let msgs = validate(&mut ipv4_codec(), &buf, false).unwrap();
+            assert_eq!(msgs.len(), 1);
+            assert!(
+                is_unreach(&msgs[0], Family::IPV4),
+                "{}-byte NEXT_HOP",
+                nh.len()
+            );
+        }
+    }
+
+    #[test]
+    fn semantically_invalid_nexthop_treat_as_withdraw() {
+        // RFC 4271 §6.3.
+        let local: IpAddr = "192.0.2.254".parse().unwrap();
+        for nh in [
+            [0, 0, 0, 0],
+            [224, 0, 0, 1],
+            [239, 255, 255, 255],
+            [240, 0, 0, 1],
+            [255, 255, 255, 255],
+            [192, 0, 2, 254],
+        ] {
+            let buf = ipv4_update_with_nexthop(&nh);
+            let parsed = ipv4_codec().parse_message(&buf).unwrap();
+            let msgs: Vec<Message> = validate_message(parsed, false, Some(local))
+                .unwrap()
+                .collect();
+            assert_eq!(msgs.len(), 1);
+            assert!(is_unreach(&msgs[0], Family::IPV4), "NEXT_HOP {nh:?}");
+        }
+        let buf = ipv4_update_with_nexthop(&[192, 0, 2, 1]);
+        let parsed = ipv4_codec().parse_message(&buf).unwrap();
+        let msgs: Vec<Message> = validate_message(parsed, false, Some(local))
+            .unwrap()
+            .collect();
+        assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
+    }
+
+    #[test]
+    fn semantically_invalid_mp_nexthop_treat_as_withdraw() {
+        let local: IpAddr = "2001:db8::fe".parse().unwrap();
+        for nh in ["::", "ff02::1", "2001:db8::fe"] {
+            let nh = Ipv6Addr::from_str(nh).unwrap().octets();
+            let mut attrs = vec![0x40, 0x01, 0x01, 0x00, 0x40, 0x02, 0x00];
+            attrs.extend_from_slice(&mp_reach_attr(0x80, Family::IPV6, &nh, &V6_NLRI));
+            let buf = raw_update(&[], &attrs, &[]);
+            let parsed = ipv6_codec().parse_message(&buf).unwrap();
+            let msgs: Vec<Message> = validate_message(parsed, false, Some(local))
+                .unwrap()
+                .collect();
+            assert_eq!(msgs.len(), 1);
+            assert!(is_unreach(&msgs[0], Family::IPV6), "next hop {nh:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_legacy_nexthop_keeps_mp_reach() {
+        // Only the routes using the invalid next hop are withdrawn.
+        let mut attrs = vec![0x40, 0x01, 0x01, 0x00, 0x40, 0x02, 0x00];
+        attrs.extend_from_slice(&[0x40, 0x03, 0x04, 0, 0, 0, 0]);
+        attrs.extend_from_slice(&mp_reach_attr(0x80, Family::IPV6, &V6_NEXTHOP, &V6_NLRI));
+        let buf = raw_update(&[], &attrs, &[0x08, 0x0a]);
+        let msgs = validate(&mut dual_codec(), &buf, false).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(is_unreach(&msgs[0], Family::IPV4));
+        assert!(matches!(
+            &msgs[1],
+            Message::Update(Update::Reach {
+                family: Family::IPV6,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -7976,7 +8120,7 @@ mod two_byte_as_tests {
         let parsed = ipv4_codec_2byte_as()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         // RFC 6793 §6 mandates plain attribute discard, not treat-as-withdraw.
         match &msgs[0] {
@@ -8005,7 +8149,7 @@ mod two_byte_as_tests {
         let parsed = ipv4_codec_2byte_as()
             .parse_message(&buf)
             .expect("parse must not fail");
-        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let msgs: Vec<Message> = validate_message(parsed, false, None).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
     }
