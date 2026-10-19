@@ -510,15 +510,16 @@ impl TableManager {
         }
     }
 
-    /// Begin the LLGR stale period for `addr`.
+    /// Begin the LLGR stale period for `addr` in `families`.
     ///
-    /// Marks the source as LLGR stale and removes any routes from that source
-    /// that carry the NO_LLGR community (RFC 9494 §4.2 MUST).  Remaining routes
-    /// are kept; the LLGR_STALE community is added at export time.
+    /// Marks the source's routes in those families (only) as LLGR stale and
+    /// removes any that carry the NO_LLGR community (RFC 9494 §4.2 MUST).
+    /// Remaining routes are kept; the LLGR_STALE community is added at export
+    /// time.
     ///
     /// Call this when `GrOutput::StartLlgrTimers` is received from the state
-    /// machine, i.e. when the GR restart timer expires or on a direct LLGR-only
-    /// session drop.
+    /// machine: at the session drop for families without GR, or when the GR
+    /// restart timer expires for the GR families LLGR covers.
     pub(crate) fn mark_llgr_stale(&self, addr: IpAddr, families: &[Family]) {
         let kernel_handle = self.kernel_handle.load_full();
         let subs = self.subscribers.load();

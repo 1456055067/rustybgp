@@ -2462,7 +2462,7 @@ async fn gr_restart_timer_expired(
     addr: IpAddr,
     generation: u64,
 ) {
-    let (awaiting_eor, delete_families, delete_llgr_families, llgr_start) = {
+    let (awaiting_eor, delete_families, delete_llgr_families, llgr_start, llgr_running) = {
         let mut ctx = context.lock().unwrap();
         if ctx.gr_timer_gen != generation {
             return;
@@ -2479,7 +2479,10 @@ async fn gr_restart_timer_expired(
                 None
             }
         });
-        (awaiting_eor, del, del_llgr, llgr)
+        // LLGR-only families may already be in their LLGR stale period,
+        // started at the session drop (RFC 9494 §4.2).
+        let llgr_running = ctx.gr_state.is_peer_restarting();
+        (awaiting_eor, del, del_llgr, llgr, llgr_running)
     };
     if awaiting_eor {
         // EOR wait timer: the peer is up again, so only the previous
@@ -2500,7 +2503,7 @@ async fn gr_restart_timer_expired(
         let timers = spawn_llgr_timers(&context, &tables, addr, &families);
         let mut ctx = context.lock().unwrap();
         ctx.llgr_family_timers.extend(timers);
-    } else {
+    } else if !llgr_running {
         // GR failed without LLGR: peer never reconnected, reset RTC state.
         let mut ctx = context.lock().unwrap();
         ctx.rtc_state.process(crate::rtc::RtcInput::SessionDropped);
@@ -12521,6 +12524,56 @@ local-address = "{local}"
         }
         apply_disconnect(&context, remote_addr, &tables, make_disconnect_info(None)).await;
         assert!(!context.lock().unwrap().gr_state.is_peer_restarting());
+    }
+
+    fn make_mixed_disconnect_info() -> DisconnectInfo {
+        // GR for IPv4; LLGR for IPv4 and IPv6, so IPv6 is LLGR-only.
+        let mut info = make_disconnect_info(Some(NegotiatedGr {
+            families: vec![Family::IPV4],
+            restart_time: Duration::from_secs(90),
+            notification_enabled: false,
+            forwarding_lost: vec![],
+        }));
+        info.negotiated_llgr = Some(NegotiatedLlgr {
+            families: vec![
+                (Family::IPV4, Duration::from_secs(3600)),
+                (Family::IPV6, Duration::from_secs(3600)),
+            ],
+        });
+        info
+    }
+
+    #[tokio::test]
+    async fn gr_llgr_disconnect_starts_llgr_for_llgr_only_families_at_once() {
+        // RFC 9494 §4.2: a family without GR has no restart period, so its
+        // LLGR stale timer starts at the drop; the GR family waits on the
+        // restart timer.
+        let tables = make_tables();
+        let context = make_context();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        apply_disconnect(&context, remote_addr, &tables, make_mixed_disconnect_info()).await;
+
+        let ctx = context.lock().unwrap();
+        assert!(ctx.gr_restart_timer.is_some());
+        let running: Vec<Family> = ctx.llgr_family_timers.keys().copied().collect();
+        assert_eq!(running, vec![Family::IPV6]);
+    }
+
+    #[tokio::test]
+    async fn gr_timer_expiry_keeps_llgr_only_families_running() {
+        let tables = make_tables();
+        let context = make_context();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        apply_disconnect(&context, remote_addr, &tables, make_mixed_disconnect_info()).await;
+        let generation = context.lock().unwrap().gr_timer_gen;
+
+        gr_restart_timer_expired(context.clone(), tables.clone(), remote_addr, generation).await;
+
+        let ctx = context.lock().unwrap();
+        assert!(ctx.gr_state.is_peer_restarting());
+        let mut running: Vec<Family> = ctx.llgr_family_timers.keys().copied().collect();
+        running.sort_unstable_by_key(|f| (f.afi(), f.safi()));
+        assert_eq!(running, vec![Family::IPV4, Family::IPV6]);
     }
 
     // --- build_local_cap tests ---
