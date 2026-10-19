@@ -213,6 +213,15 @@ pub struct Path {
     pub attr: Arc<Vec<packet::Attribute>>,
 }
 
+impl Path {
+    /// True if the path is in the LLGR stale period: either its source was
+    /// marked LLGR stale by this helper, or it carries the LLGR_STALE
+    /// community (0xFFFF0006) propagated from another helper.
+    pub fn is_llgr_stale(&self) -> bool {
+        self.source.is_llgr_stale() || has_llgr_stale_community(&self.attr)
+    }
+}
+
 struct RibEntry {
     path: Path,
     /// Pre-import-policy attributes received from the peer (Adj-RIB-In view).
@@ -280,13 +289,6 @@ impl RibEntry {
         } else {
             self.flags &= !RibEntry::FLAG_NEXTHOP_INVALID;
         }
-    }
-
-    /// True if this entry is in the LLGR stale period: either the source was
-    /// marked LLGR stale by the helper, or the received attributes carry the
-    /// LLGR_STALE community (0xFFFF0006) propagated from another helper.
-    fn is_llgr_stale(&self) -> bool {
-        self.path.source.is_llgr_stale() || has_llgr_stale_community(&self.path.attr)
     }
 }
 
@@ -987,6 +989,22 @@ impl Source {
         self.llgr_stale.store(true, Ordering::Relaxed);
     }
 
+    /// A copy of this source with the LLGR stale flag set (and the GR stale
+    /// flag carried over), for paths whose family entered the LLGR stale
+    /// period while the session's other families did not.
+    pub fn llgr_stale_copy(&self) -> Self {
+        Source {
+            remote_addr: self.remote_addr,
+            local_addr: self.local_addr,
+            remote_asn: self.remote_asn,
+            local_asn: self.local_asn,
+            router_id: self.router_id,
+            role: self.role,
+            stale: AtomicBool::new(self.is_stale()),
+            llgr_stale: AtomicBool::new(true),
+        }
+    }
+
     pub fn clear_llgr_stale(&self) {
         self.llgr_stale.store(false, Ordering::Relaxed);
     }
@@ -1074,12 +1092,26 @@ impl Table {
         self.collect_loc_rib_paths_impl(family, usize::MAX)
     }
 
+    /// Like [`Self::collect_loc_rib_paths`], capped at `max_paths` per
+    /// destination, for exporting to a peer (initial dump, route refresh).
+    ///
+    /// Returns nothing while `family` is deferred: best paths aren't final
+    /// until selection deferral ends (RFC 4724 §4.2), and `end_deferral()`
+    /// distributes them then.
     pub fn collect_loc_rib_paths_limited(
         &self,
         family: &Family,
         max_paths: usize,
     ) -> Vec<NlriChange> {
+        if self.is_deferring(family) {
+            return Vec::new();
+        }
         self.collect_loc_rib_paths_impl(family, max_paths)
+    }
+
+    /// True while best-path selection for `family` is deferred.
+    pub fn is_deferring(&self, family: &Family) -> bool {
+        self.ribs.get(family).is_some_and(|r| r.deferring)
     }
 
     pub fn state(&self, family: Family) -> TableState {
@@ -1844,7 +1876,12 @@ impl Table {
     }
 
     /// Remove LLGR stale routes for `addr` in `family` when the LLGR stale
-    /// timer expires. Mirrors `drop_stale()` but checks `is_llgr_stale()`.
+    /// timer expires or EOR arrives after a reconnect. Mirrors `drop_stale()`
+    /// but checks the source's LLGR stale flag.
+    ///
+    /// Only the source flag counts: a fresh route from the reconnected peer
+    /// may itself carry the LLGR_STALE community (relayed from further away)
+    /// and must survive the cleanup of the previous session's routes.
     pub fn drop_llgr_stale(
         &mut self,
         addr: IpAddr,
@@ -1859,7 +1896,7 @@ impl Table {
                 if !dst
                     .entry
                     .iter()
-                    .any(|e| e.path.source.remote_addr == addr && e.is_llgr_stale())
+                    .any(|e| e.path.source.remote_addr == addr && e.path.source.is_llgr_stale())
                 {
                     return true;
                 }
@@ -1867,21 +1904,22 @@ impl Table {
                 let old_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
                 let removed_any_unfiltered = dst.entry.iter().any(|e| {
                     e.path.source.remote_addr == addr
-                        && e.is_llgr_stale()
+                        && e.path.source.is_llgr_stale()
                         && !e.is_filtered()
                         && !e.is_nexthop_invalid()
                 });
 
                 for e in dst.entry.iter() {
                     if e.path.source.remote_addr == addr
-                        && e.is_llgr_stale()
+                        && e.path.source.is_llgr_stale()
                         && let Some(nh) = e.path.nexthop
                     {
                         removed_nexthops.push(nh.addr());
                     }
                 }
-                dst.entry
-                    .retain(|e| !(e.path.source.remote_addr == addr && e.is_llgr_stale()));
+                dst.entry.retain(|e| {
+                    !(e.path.source.remote_addr == addr && e.path.source.is_llgr_stale())
+                });
 
                 let peer_still_has_path =
                     dst.entry.iter().any(|p| p.path.source.remote_addr == addr);
@@ -2043,16 +2081,22 @@ impl Table {
         changes
     }
 
-    /// Mark the source for `addr` as LLGR stale in `family`.
+    /// Mark the paths from `addr` in `family` as LLGR stale.
     ///
-    /// Sets `source.mark_llgr_stale()` on all paths from `addr`, re-sorts
-    /// affected destinations, and returns best-path changes for distribution.
-    /// Mirrors `restale()` but for the LLGR stale flag.
+    /// A source is shared by all of a session's families, but the LLGR stale
+    /// period is per family (RFC 9494 §4.2: a family without GR starts it as
+    /// soon as the session drops, while GR families are still in the restart
+    /// period).  So instead of flagging the shared source, each path is moved
+    /// to an LLGR-stale copy of it that only this family's paths use.
+    /// Affected destinations are re-sorted and best-path changes returned for
+    /// distribution.  Mirrors `restale()` but for the LLGR stale flag.
     ///
     /// The caller must also call `drop_no_llgr()` for the same addr/family to
     /// delete paths that carry the NO_LLGR community (RFC 9494 §4.2 MUST).
     pub fn restale_llgr(&mut self, addr: IpAddr, family: Family) -> Vec<NlriChange> {
         let mut changes = Vec::new();
+        // One LLGR-stale copy per original source, shared by its paths here.
+        let mut copies: Vec<(*const Source, Arc<Source>)> = Vec::new();
         if let Some(rt) = self.ribs.get_mut(&family) {
             for (net, dst) in rt.destinations.iter_mut() {
                 if !dst.entry.iter().any(|p| p.path.source.remote_addr == addr) {
@@ -2063,9 +2107,18 @@ impl Table {
                     .entry
                     .iter()
                     .any(|e| e.path.source.remote_addr == addr && !e.is_filtered());
-                for p in dst.entry.iter() {
-                    if p.path.source.remote_addr == addr {
-                        p.path.source.mark_llgr_stale();
+                for p in dst.entry.iter_mut() {
+                    if p.path.source.remote_addr == addr && !p.path.source.is_llgr_stale() {
+                        let orig = Arc::as_ptr(&p.path.source);
+                        let copy = match copies.iter().find(|(o, _)| *o == orig) {
+                            Some((_, c)) => Arc::clone(c),
+                            None => {
+                                let c = Arc::new(p.path.source.llgr_stale_copy());
+                                copies.push((orig, Arc::clone(&c)));
+                                c
+                            }
+                        };
+                        p.path.source = copy;
                     }
                 }
                 select(&mut dst.entry, net);
@@ -5417,6 +5470,26 @@ mod tests {
     }
 
     #[test]
+    fn deferral_hides_routes_from_peer_exports() {
+        // The initial dump and route refresh must not export best paths that
+        // selection deferral hasn't settled yet.
+        let mut rt = Table::new(0);
+        rt.start_deferral(Family::IPV4);
+        let s = source(1, 65001, 65000, 1);
+        insert_with_attrs(&mut rt, &s, &nlri(10, 0, 0, 0, 24), attrs_with_origin(0));
+
+        assert!(rt.is_deferring(&Family::IPV4));
+        assert!(
+            rt.collect_loc_rib_paths_limited(&Family::IPV4, 1)
+                .is_empty()
+        );
+
+        rt.end_deferral(Family::IPV4);
+        assert!(!rt.is_deferring(&Family::IPV4));
+        assert_eq!(rt.collect_loc_rib_paths_limited(&Family::IPV4, 1).len(), 1);
+    }
+
+    #[test]
     fn end_deferral_on_non_deferred_family_is_noop() {
         // end_deferral on a family that was never deferred returns empty.
         let mut rt = Table::new(0);
@@ -6505,6 +6578,29 @@ mod tests {
         );
     }
 
+    fn insert_ipv6_path(rt: &mut Table, source: &Arc<Source>) {
+        let net6 = packet::Nlri::V6(packet::bgp::Ipv6Net {
+            addr: std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
+            mask: 32,
+        });
+        let nh6 = Some(bgp::Nexthop::V6(std::net::Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1,
+        )));
+        rt.insert(
+            source.clone(),
+            Family::IPV6,
+            net6,
+            0,
+            nh6,
+            attrs_with_origin(0),
+            None,
+            false,
+            false,
+            None,
+            0u32,
+        );
+    }
+
     // --- restale_llgr ---
 
     #[test]
@@ -6516,7 +6612,34 @@ mod tests {
 
         assert!(!s.is_llgr_stale());
         rt.restale_llgr(s.remote_addr, Family::IPV4);
-        assert!(s.is_llgr_stale());
+        let best = flat_best(&rt, &Family::IPV4);
+        assert!(best[0].1.source.is_llgr_stale());
+    }
+
+    #[test]
+    fn restale_llgr_leaves_other_families_alone() {
+        // LLGR is per family: a family entering LLGR must not make the same
+        // session's paths in another family LLGR stale.
+        let mut rt = Table::new(0);
+        let s = source(1, 65001, 65000, 1);
+        s.mark_stale();
+        insert_with_attrs(&mut rt, &s, &nlri(10, 0, 0, 0, 24), attrs_with_origin(0));
+        insert_ipv6_path(&mut rt, &s);
+
+        rt.restale_llgr(s.remote_addr, Family::IPV4);
+
+        assert!(!s.is_llgr_stale());
+        let v4 = flat_best(&rt, &Family::IPV4);
+        assert!(v4[0].1.source.is_llgr_stale());
+        assert!(v4[0].1.source.is_stale(), "GR stale flag must carry over");
+        let v6 = flat_best(&rt, &Family::IPV6);
+        assert!(!v6[0].1.source.is_llgr_stale());
+
+        let (changes, _) = rt.drop_llgr_stale(s.remote_addr, Family::IPV6, None);
+        assert!(changes.is_empty());
+        assert_eq!(flat_best(&rt, &Family::IPV6).len(), 1);
+        rt.drop_llgr_stale(s.remote_addr, Family::IPV4, None);
+        assert!(flat_best(&rt, &Family::IPV4).is_empty());
     }
 
     #[test]
@@ -6631,6 +6754,26 @@ mod tests {
         let best = flat_best(&rt, &Family::IPV4);
         assert_eq!(best.len(), 1);
         assert_eq!(best[0].1.source.remote_addr, s2.remote_addr);
+    }
+
+    #[test]
+    fn drop_llgr_stale_keeps_fresh_routes_with_llgr_stale_community() {
+        // After a reconnect the peer's fresh source isn't LLGR stale, even if
+        // the route it sent carries LLGR_STALE; only the old source's routes go.
+        let mut rt = Table::new(0);
+        let old_net = nlri(10, 0, 0, 0, 24);
+        let fresh_net = nlri(10, 0, 1, 0, 24);
+        let old = source(1, 65001, 65000, 1);
+        insert_with_attrs(&mut rt, &old, &old_net, attrs_with_origin(0));
+        old.mark_llgr_stale();
+        let fresh = source(1, 65001, 65000, 1);
+        insert_with_attrs(&mut rt, &fresh, &fresh_net, attrs_with_llgr_stale());
+
+        rt.drop_llgr_stale(old.remote_addr, Family::IPV4, None);
+
+        let best = flat_best(&rt, &Family::IPV4);
+        assert_eq!(best.len(), 1);
+        assert!(Arc::ptr_eq(&best[0].1.source, &fresh));
     }
 
     #[test]
