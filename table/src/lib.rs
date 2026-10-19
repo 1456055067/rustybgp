@@ -213,6 +213,15 @@ pub struct Path {
     pub attr: Arc<Vec<packet::Attribute>>,
 }
 
+impl Path {
+    /// True if the path is in the LLGR stale period: either its source was
+    /// marked LLGR stale by this helper, or it carries the LLGR_STALE
+    /// community (0xFFFF0006) propagated from another helper.
+    pub fn is_llgr_stale(&self) -> bool {
+        self.source.is_llgr_stale() || has_llgr_stale_community(&self.attr)
+    }
+}
+
 struct RibEntry {
     path: Path,
     /// Pre-import-policy attributes received from the peer (Adj-RIB-In view).

@@ -549,6 +549,13 @@ impl Peer {
             local_addr: IpAddr::V4(self.config.local_router_id),
             link_addr: None,
             confederation_id: global.confederation.as_ref().map_or(0, |c| c.id),
+            llgr_families: self
+                .state
+                .remote_cap
+                .load()
+                .as_deref()
+                .map(|caps| llgr_capable_families(caps))
+                .unwrap_or_default(),
         }
     }
 
@@ -2084,6 +2091,20 @@ fn gr_on_disconnect(
     if applies { Some(gr) } else { None }
 }
 
+/// Families for which the peer advertised the LLGR capability, i.e. that
+/// may receive LLGR_STALE routes (RFC 9494 §4.5).
+fn llgr_capable_families(remote_capabilities: &[packet::Capability]) -> FnvHashSet<Family> {
+    remote_capabilities
+        .iter()
+        .find_map(|c| match c {
+            packet::Capability::LongLivedGracefulRestart(v) => {
+                Some(v.iter().map(|(f, _, _)| *f).collect())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// Filter the negotiated GR/LLGR state down to what survives this disconnect.
 ///
 /// GR follows [`gr_on_disconnect`].  LLGR follows the same rules (RFC 9494
@@ -2639,6 +2660,7 @@ impl PeerSession {
             local_addr,
             link_addr,
             confederation_id: res.confederation_id,
+            llgr_families: FnvHashSet::default(),
         };
         let codec = export_ctx.build_codec();
 
@@ -2727,6 +2749,7 @@ impl PeerSession {
                 local_addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                 link_addr: None,
                 confederation_id: 0,
+                llgr_families: FnvHashSet::default(),
             },
             state: Arc::new(PeerState {
                 fsm: AtomicU8::new(0),
@@ -2837,12 +2860,11 @@ impl PeerSession {
     /// Negotiate LLGR (RFC 9494) using local and remote LongLivedGracefulRestart capabilities.
     ///
     /// Returns Some when both sides advertise the capability with at least one family in common
-    /// and the negotiated stale time is non-zero.
+    /// for which the peer's stale time is non-zero.
     ///
-    /// Per RFC 9494 s3, the stale time comes from the peer's capability (how long they want us
-    /// to preserve their stale routes).  When the peer sends 0 for a family, LLGR MUST NOT be
-    /// activated for that family; we fall back to our locally configured time so that a peer
-    /// that omits the field (effectively sending 0) does not silently disable LLGR helper mode.
+    /// Per RFC 9494 §3, the stale time comes from the peer's capability (how long they want us
+    /// to preserve their stale routes).  A peer stale time of 0 means the peer doesn't want
+    /// LLGR for that family, so it is left out.
     fn negotiate_llgr(&self, remote_capabilities: &[packet::Capability]) -> Option<NegotiatedLlgr> {
         let local_families: Vec<(Family, u32)> = self.local_cap.iter().find_map(|c| match c {
             packet::Capability::LongLivedGracefulRestart(v) => {
@@ -2859,17 +2881,12 @@ impl PeerSession {
 
         let families: Vec<(Family, std::time::Duration)> = local_families
             .iter()
-            .filter_map(|(local_f, local_time)| {
+            .filter_map(|(local_f, _)| {
                 let (f, _, peer_time) = peer_families.iter().find(|(pf, _, _)| pf == local_f)?;
-                let stale_secs = if *peer_time > 0 {
-                    *peer_time
-                } else {
-                    *local_time
-                };
-                if stale_secs == 0 {
+                if *peer_time == 0 {
                     return None;
                 }
-                Some((*f, std::time::Duration::from_secs(stale_secs as u64)))
+                Some((*f, std::time::Duration::from_secs(*peer_time as u64)))
             })
             .collect();
 
@@ -3175,6 +3192,7 @@ impl PeerSession {
                     // is consumed by Arc::new below.
                     self.negotiated_gr = self.negotiate_gr(&remote_capabilities);
                     self.negotiated_llgr = self.negotiate_llgr(&remote_capabilities);
+                    self.export_ctx.llgr_families = llgr_capable_families(&remote_capabilities);
                     effects.push(GlobalEffect::GrSessionEstablished {
                         negotiated_gr: self.negotiated_gr.clone(),
                     });
@@ -8092,20 +8110,32 @@ local-address = "{local}"
     }
 
     #[tokio::test]
-    async fn negotiate_llgr_falls_back_to_local_time_when_peer_sends_zero() {
-        // Peer sends stale-time=0 (some implementations omit the value or send 0).
-        // RFC 9494 says LLGR MUST NOT activate for that family, but we fall back to
-        // our locally configured time so that helper mode still engages.
+    async fn negotiate_llgr_none_when_peer_sends_zero() {
+        // RFC 9494: a peer stale time of 0 means no LLGR for that family, even
+        // though we have a local time configured.
         let session = make_session_with_llgr_cap(300); // local: 300s
         let remote_caps = vec![packet::Capability::LongLivedGracefulRestart(vec![(
             Family::IPV4,
             0,
             0, // peer sends 0
         )])];
+        assert!(session.negotiate_llgr(&remote_caps).is_none());
+    }
+
+    #[tokio::test]
+    async fn negotiate_llgr_uses_peer_time_when_local_is_zero() {
+        // Our own stale time only tells the peer how long to keep our routes.
+        let session = make_session_with_llgr_cap(0);
+        let remote_caps = vec![packet::Capability::LongLivedGracefulRestart(vec![(
+            Family::IPV4,
+            0,
+            300,
+        )])];
         let llgr = session.negotiate_llgr(&remote_caps).unwrap();
-        assert_eq!(llgr.families.len(), 1);
-        assert_eq!(llgr.families[0].0, Family::IPV4);
-        assert_eq!(llgr.families[0].1, Duration::from_secs(300)); // fallback to local
+        assert_eq!(
+            llgr.families,
+            vec![(Family::IPV4, Duration::from_secs(300))]
+        );
     }
 
     #[tokio::test]
@@ -8289,6 +8319,7 @@ local-address = "{local}"
                 local_addr: "127.0.0.1".parse().unwrap(),
                 link_addr: None,
                 confederation_id: 0,
+                llgr_families: FnvHashSet::default(),
             }
         }
 
@@ -9090,6 +9121,7 @@ local-address = "{local}"
                 local_addr: "127.0.0.1".parse().unwrap(),
                 link_addr: None,
                 confederation_id: 0,
+                llgr_families: FnvHashSet::default(),
             }
         }
 
@@ -9655,6 +9687,7 @@ local-address = "{local}"
                 local_addr: "127.0.0.1".parse().unwrap(),
                 link_addr: None,
                 confederation_id: 65000,
+                llgr_families: FnvHashSet::default(),
             }
         }
 
@@ -9665,6 +9698,7 @@ local-address = "{local}"
                 local_addr: "127.0.0.1".parse().unwrap(),
                 link_addr: None,
                 confederation_id: 65000,
+                llgr_families: FnvHashSet::default(),
             }
         }
 
@@ -9785,6 +9819,7 @@ local-address = "{local}"
                 local_addr: "127.0.0.1".parse().unwrap(),
                 link_addr: None,
                 confederation_id: 0,
+                llgr_families: FnvHashSet::default(),
             }
         }
 
@@ -10153,6 +10188,7 @@ local-address = "{local}"
                 local_addr: "127.0.0.1".parse().unwrap(),
                 link_addr: None,
                 confederation_id: 0,
+                llgr_families: FnvHashSet::default(),
             }
         }
 
@@ -10267,6 +10303,12 @@ local-address = "{local}"
                 })
         }
 
+        fn llgr_ctx() -> PeerExportContext {
+            let mut ctx = ebgp_ctx();
+            ctx.llgr_families.insert(Family::IPV4);
+            ctx
+        }
+
         #[test]
         fn llgr_stale_source_adds_llgr_stale_community() {
             const LLGR_STALE: u32 = 0xffff_0006;
@@ -10284,7 +10326,7 @@ local-address = "{local}"
                 SELF.parse().unwrap(),
                 &mut em,
                 &mut pending,
-                &ebgp_ctx(),
+                &llgr_ctx(),
                 None,
                 None,
                 None,
@@ -10327,6 +10369,126 @@ local-address = "{local}"
                 !has_community(&attrs, LLGR_STALE),
                 "LLGR_STALE community must not appear"
             );
+        }
+
+        #[test]
+        fn llgr_stale_route_withheld_from_non_llgr_peer() {
+            // RFC 9494 §4.5: the peer didn't send the LLGR capability, so the
+            // LLGR stale route is not advertised to it.
+            let mut em = ExportMap::default();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let src = source(PEER);
+            src.mark_llgr_stale();
+            let update = change(&net, true, false, None, vec![path(0, src)]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            assert!(!em.was_sent(Family::IPV4, 1));
+            assert!(pending.drain_messages(Family::IPV4).is_empty());
+        }
+
+        #[test]
+        fn route_becoming_llgr_stale_is_withdrawn_from_non_llgr_peer() {
+            let mut em = ExportMap::default();
+            em.mark_sent(Family::IPV4, 1, 0);
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let src = source(PEER);
+            src.mark_llgr_stale();
+            let update = change(&net, true, false, None, vec![path(0, src)]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            assert!(!em.was_sent(Family::IPV4, 1));
+            let msgs = pending.drain_messages(Family::IPV4);
+            assert!(reach_attrs(&msgs).is_none());
+            assert!(!msgs.is_empty(), "previously sent route must be withdrawn");
+        }
+
+        #[test]
+        fn relayed_llgr_stale_community_withheld_from_non_llgr_peer() {
+            // A route that already carries LLGR_STALE from another helper is
+            // LLGR stale too, even though our source for it is fresh.
+            let mut em = ExportMap::default();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let mut p = path(0, source(PEER));
+            p.attr = with_llgr_stale_community(&p.attr);
+            let update = change(&net, true, false, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            assert!(pending.drain_messages(Family::IPV4).is_empty());
+        }
+
+        #[test]
+        fn addpath_llgr_stale_path_withheld_from_non_llgr_peer() {
+            let mut em = ExportMap::new([Family::IPV4]);
+            let mut pending = crate::peer_tx::PendingTx::new(true);
+            let net = nlri("10.0.0.0/24");
+            let stale = source(PEER);
+            stale.mark_llgr_stale();
+            let update = change(
+                &net,
+                true,
+                true,
+                None,
+                vec![path(1, source("10.0.0.3")), path(2, stale)],
+            );
+
+            process_nlri_change(
+                &update,
+                2,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            assert!(em.contains_path(Family::IPV4, 1, 1));
+            assert!(!em.contains_path(Family::IPV4, 1, 2));
         }
 
         // ---- RFC 1997 well-known communities ----
